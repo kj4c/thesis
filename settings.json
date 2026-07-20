@@ -1,0 +1,8 @@
+{
+  "input_method": "text",
+  "shortcut": "Ctrl+Return",
+  "permission_frequency": "every_step",
+  "glasses_port": 8765,
+  "glasses_autostart": false,
+  "glasses_device": null
+}

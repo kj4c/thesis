@@ -9,8 +9,8 @@ async def run_baseline_demo():
     print("🚀 [DEMO START] Initiating Baseline Test with GPT-4o-Mini...")
     
     # 1. Initialize the patched frontier model
-    # llm = ChatGoogle(model="gemini-2.5-flash")
-    llm = ChatOpenAI(model="gpt-5-nano")
+    llm = ChatGoogle(model="gemini-2.5-flash")
+    # llm = ChatOpenAI(model="gpt-5-nano")
     
     task_prompt = (
         "Go to amazon and find me the first price you see after searching up spoons"
