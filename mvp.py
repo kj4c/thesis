@@ -1,160 +1,83 @@
 # based on demo_part3 by KJ
+# entry point: run the agent as an interactive chat. the pieces live in
+# llm.py (model), state.py (state + resources), nodes.py (the nodes),
+# graph.py (the graph). run with:  python mvp.py
 
 import asyncio
-from typing import TypedDict, Literal
-from dotenv import load_dotenv
-
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import InMemorySaver
+import time
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import Command, RetryPolicy, TimeoutPolicy
-from langgraph.errors import NodeError
 
+import llm  # for PLANNER_PROVIDER / PLANNER_MODELS (to report the model in use)
+from graph import build_agent, build_workflow
+from state import _start_resources, _run_config
 
-load_dotenv()
-
-class PipelineState(TypedDict, total=False):
-    # original natural language request from user
-    query: str
-    '''
-    TODO:
-    properties that update as it progresses based on current node plan
-    - relevant perception information
-    - adjusted query
-    - current plan (to execute)
-    '''
-    
-# ── Node 1: Conversational Node  ─────────────────────────────────────────────
-'''
-    This one is for questions like 'what is on this page' and 'where is the
-    search bar'? May include an option to ask user if they want to switch to
-    'executive mode' if it sounds like they want a specific task done. 
-    
-    Potentially can be reused to judge what went wrong for a task after human
-    approval is denied.
-'''
-async def respond(query: str) -> str:
-    ... # TODO
-    
-def is_task(query: str) -> bool:
-    # either LLM or action, depending on how we implement it
-    ... # TODO
-
-# ── Node 2: plan ──────────────────────────────────────────────---------------
-'''
-    As I see it, this is for collecting the vision-based coord mapping &
-    text-only DOM for the next node by just hitting both AI with the OG query
-    (and potentially the plan, or even information from the database to catch
-    disruptions, e.g. popus, 404s). Its main point is to notice if there's a
-    disruption and verify that the AI are mostly in agreement, or close to.
-    
-    Might split the node into one for VBC & one for DOM (AKA one for each AI).
-    
-    RE: plan/database as arguments, may be good to add for context, but we
-    then have to figure the function overload, shape of the query & how to
-    format either option.
-    
-    RE: verification, may create an extra node or cut it out and double down
-    in next node instead of verifying within this node.
-    
-'''
-async def plan(query: str) -> str:
-    ... # TODO
-
-# ── Node 3: analyse ──────────────────────────────────────────────────────────
-'''
-    Takes query and updated response to query (or specific step, still not
-    clear on that detail), confirms (re-verifies) consensus and checks if
-    approval is needed (based on user preference and verification result).
-    
-    Assume we choose 1 of the two AI for this node.
-'''
-async def analyse(query: str, perception_data: str) -> str:
-    ... # TODO
-    
-def ask_approval(question: str) -> bool:
-    # user input
-    ... # TODO
-    
-# ── Node 4: execute ──────────────────────────────────────────────────────────
-'''
-    Self-explanatory, no AI, just browser control and a defined error class.
-    
-    Might just be a function instead, need to revisit what defines a node.
-'''
-async def execute(query: str, perception_data: str) -> str:
-    ... # TODO
-    
-# ── Node 5: resolve ──────────────────────────────────────────────────────────
-'''
-    Primarily saving information to the database and training data. Might need
-    AI to intuit what it should save? I don't know about that.
-    
-    Also, depending on how the edges work, this node may define if the
-    graph goes to END now.
-'''
-async def resolve(query: str, success: str) -> str:
-    ... # TODO
-
-# ── LangGraph workflow ───────────────────────────────────────────────────────
-    
-async def node_respond(state: PipelineState) -> Command[Literal["plan", "__end__"]]:
-    # LLM + user input (it is its own loop)
-    ... # TODO
-
-async def node_plan(state: PipelineState) -> PipelineState:
-    # LMM
-    ... # TODO
-
-async def node_analyse(state: PipelineState) -> Command[Literal["respond", "execute"]]:
-    # LLM
-    ... # TODO
-
-async def node_execute(state: PipelineState) -> PipelineState:
-    # action
-    ... # TODO
-    
-async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__"]]:
-    # data
-    ... # TODO
-    
-# TODO: define status & default error handler
-# START: error handling placeholder
-class State(TypedDict):
-    status: str
-
-def default_error_handler(state: State, error: NodeError) -> State:
-    return {"status": f"handled: {error.error}"}
-# END: error handling placeholder
-
-def build_workflow():
-    g: StateGraph[PipelineState] = StateGraph(PipelineState)
-    
-    g.set_node_defaults(
-        retry_policy=RetryPolicy(max_attempts=3),
-        error_handler=default_error_handler,
-        timeout=TimeoutPolicy(run_timeout=30),
-    )
-    
-    g.add_node("respond", node_respond)
-    g.add_node("plan", node_plan)
-    g.add_node("analyse", node_analyse)
-    g.add_node("execute", node_execute)
-    g.add_node("resolve", node_resolve)
-    
-    # conditional edges return the edge they go to
-    g.add_edge("START", "respond")
-    g.add_edge("plan", "analyse")
-    g.add_edge("execute", "resolve")
-    memory = InMemorySaver()
-    return g.compile(checkpointer=memory)
 
 async def run_pipeline(query: str):
     # TODO: connect to main properly once it is finished
     workflow = build_workflow()
     config: RunnableConfig = {"configurable": {"thread_id": "1"}}
-    await workflow.invoke({"query": query}, config)
+    # note: the async entrypoint is `ainvoke`, not `invoke`
+    await workflow.ainvoke({"query": query}, config)
+
+
+async def run_turn(workflow, query: str, config: RunnableConfig):
+    # run one user turn. the user message gets appended to the saved transcript
+    # (operator.add reducer), so history piles up across turns.
+    await workflow.ainvoke(
+        {"query": query, "messages": [{"role": "user", "content": query}]},
+        config,
+    )
+
+
+async def run_once(query: str, thread_id: str = "1"):
+    # single-shot: one prompt, then tear down. handy for non-interactive tests.
+    session, tools, file_system = await _start_resources()
+    try:
+        workflow = build_agent()
+        await run_turn(workflow, query, _run_config(session, tools, file_system, thread_id))
+    finally:
+        await session.kill()
+
+
+async def run_chat(thread_id: str = "1"):
+    # interactive chat: one browser + one thread_id shared across turns, so the
+    # agent remembers the conversation. type 'quit' (or ctrl+c / ctrl+d) to exit.
+    session, tools, file_system = await _start_resources()
+    workflow = build_agent()
+    config = _run_config(session, tools, file_system, thread_id)
+    print(f"planner: {llm.PLANNER_PROVIDER} / {llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER, '?')}")
+    try:
+        while True:
+            try:
+                query = input("\nyou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nbye")
+                break
+            if query.lower() in ("quit", "exit", ""):
+                break
+            # type `history` to dump what the agent currently remembers — makes
+            # the chat memory easy to eyeball while testing.
+            if query.lower() == "history":
+                msgs = workflow.get_state(config).values.get("messages", [])
+                print("── remembered so far ────────────────────")
+                for m in msgs:
+                    print(f"  {m['role']}: {m['content']}")
+                continue
+            start = time.perf_counter()
+            try:
+                await run_turn(workflow, query, config)
+            except KeyboardInterrupt:
+                # ctrl+c mid-task: stop this task but stay in the chat
+                print("\n[stopped] task interrupted — still here, ask me something else.")
+            print(f"⏱  {time.perf_counter() - start:.1f}s")
+    finally:
+        # always close the browser cleanly, however we leave the loop
+        print("closing browser…")
+        await session.kill()
 
 if __name__ == "__main__":
-    # TODO: function (or inline code) that connects to the UI and takes in input, gets query, gives query to pipeline, loop
-    asyncio.run(run_pipeline(""))
+    # interactive chat that remembers across prompts within the session
+    try:
+        asyncio.run(run_chat())
+    except KeyboardInterrupt:
+        pass
