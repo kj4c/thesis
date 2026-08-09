@@ -19,11 +19,8 @@ PLANNER_MODELS = {
     "gemini": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
 }
 
-def make_planner_llm():
-    # builds the planner llm for whatever PLANNER_PROVIDER is set to. the one
-    # place we choose the model, so the nodes just call this
-    provider = PLANNER_PROVIDER
-    model = PLANNER_MODELS.get(provider)
+def _build_llm(provider: str, model: str):
+    # turn a provider name + model into a browser-use chat object with the right key
     if provider == "ollama":
         # local ollama server (defaults to http://localhost:11434). no key, no limits
         return ChatOllama(model=model, host=os.getenv("OLLAMA_HOST"))
@@ -40,8 +37,45 @@ def make_planner_llm():
             api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
         )
     raise ValueError(
-        f"Unknown PLANNER_PROVIDER {provider!r}; use ollama | groq | anthropic | gemini"
+        f"Unknown provider {provider!r}; use ollama | groq | anthropic | gemini"
     )
+
+
+def make_planner_llm():
+    # the planner / DOM-verifier model (text). one place to choose it
+    return _build_llm(PLANNER_PROVIDER, PLANNER_MODELS.get(PLANNER_PROVIDER))
+
+
+# ── vision model  ──────────
+# set USE_VISION=false to turn the consensus off and fall back to DOM-only verification
+USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
+VISION_PROVIDER = os.getenv("VISION_PROVIDER", "gemini").lower()
+_VISION_DEFAULTS = {
+    "gemini": "gemini-3.5-flash",
+    "anthropic": "claude-haiku-4-5-20251001",
+    "ollama": "qwen2.5vl:7b",
+    "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
+}
+VISION_MODEL = os.getenv("VISION_MODEL", _VISION_DEFAULTS.get(VISION_PROVIDER, "gemini-3.5-flash"))
+
+
+def make_vision_llm():
+    # returns None when vision is disabled -> analyse uses DOM-only verification
+    if not USE_VISION:
+        return None
+    return _build_llm(VISION_PROVIDER, VISION_MODEL)
+
+
+# ── extraction model (for the `extract` action) ──────────────────────────────
+# extract sends the WHOLE page to the model, so it needs a big context + generous
+# rate limit. the planner model can be too small. defaults to the vision model
+# (gemini), independently overridable via EXTRACTION_PROVIDER / EXTRACTION_MODEL.
+EXTRACTION_PROVIDER = os.getenv("EXTRACTION_PROVIDER", VISION_PROVIDER).lower()
+EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", VISION_MODEL)
+
+
+def make_extraction_llm():
+    return _build_llm(EXTRACTION_PROVIDER, EXTRACTION_MODEL)
 
 
 def _parse_retry_seconds(msg: str) -> float | None:
