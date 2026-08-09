@@ -13,7 +13,7 @@ from state import _start_resources, _run_config
 
 
 async def run_pipeline(query: str):
-    # TODO: connect to main properly once it is finished
+    # TODO: connect to UI properly once it is finished
     workflow = build_workflow()
     config: RunnableConfig = {"configurable": {"thread_id": "1"}}
     # note: the async entrypoint is `ainvoke`, not `invoke`

@@ -35,7 +35,7 @@ def build_workflow():
     g.add_node("execute", nodes.node_execute)
     g.add_node("resolve", nodes.node_resolve)
 
-    # conditional edges return the edge they go to
+    # constant (conditional edges return the edge they go to)
     g.add_edge("START", "respond")
     g.add_edge("plan", "analyse")
     g.add_edge("execute", "resolve")

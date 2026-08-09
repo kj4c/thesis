@@ -37,3 +37,22 @@ requirements
   - schema + method to send relevant information to the database before it's reset for the next prompt; may use stor
   - these have to be changed once production is involved
 - prompts: need to pay close attention to token usage, context window... re: usage costs
+
+## code review
+
+notes for nicole
+- understanding of flow is accurate (judging by what you've written in comments and done)!
+
+notes for me
+- gotta catch up on the llms added to env example (e.g. groq) so i can check if anything is off, shouldn't be
+- gotta update todo
+
+not done
+- parallel planner
+- change all memory saver parts to reflect the change in how we store memory
+  - context: originally was setting up for local, which is slightly different
+  - (includes changes to the SQLite checkpointer and store, IIRC, will check)
+- connect to ui
+- define status & default error handler
+- testing suite (i have webvoyager saved, need to look into connecting)
+- maybe change structure to do usual python init spiel (as is seems fine)
