@@ -1,10 +1,9 @@
 This is a primer on the state of and plan for the MVP if anyone needs to take over or complete a specific task.
-## current state - last bit of design consideration before implementation
+## current state - mvp
 requirements
 - describe and complete gui agent actions (w/ or w/o user approval based on preferences)
 - describe webpages (aka conversationally answer questions about what's on the screen)
 - save relevant data to its database (which may be in an aws bucket because of the glasses)
-- create training data for non-commercial ai (temporary)
 - receive images from meta glasses, prompt user about them and do* something w/ them
 \*meaning of 'do' is unclear but assumedly process in some way, such as reading links or looking up products
 ## plan
@@ -34,25 +33,19 @@ requirements
 - error: default handler, define statuses, and test how it's going
 - data:
   - checkpoints for human in the loop, and managing length of checkpoints
-  - schema + method to send relevant information to the database before it's reset for the next prompt; may use stor
-  - these have to be changed once production is involved
+  - schema + method to send relevant information to the database before it's reset for the next prompt; may use store
+  - these have to be changed once servers are involved
 - prompts: need to pay close attention to token usage, context window... re: usage costs
 
-## code review
-
-notes for nicole
-- understanding of flow is accurate (judging by what you've written in comments and done)!
-
-notes for me
-- gotta catch up on the llms added to env example (e.g. groq) so i can check if anything is off, shouldn't be
-- gotta update todo
-
-not done
-- parallel planner
-- change all memory saver parts to reflect the change in how we store memory
-  - context: originally was setting up for local, which is slightly different
-  - (includes changes to the SQLite checkpointer and store, IIRC, will check)
+## todo (disregarding glasses)
+- remove stubs and irrelevant comments
+- implement parallel planner (the one with visual mapping)
+- change all memory saver parts to reflect the change in how we store memory (check documentation)
 - connect to ui
 - define status & default error handler
-- testing suite (i have webvoyager saved, need to look into connecting)
-- maybe change structure to do usual python init spiel (as is seems fine)
+- testing suite (webvoyager)
+- diagnose poor performance
+
+ana specifically:
+- gotta catch up on the llms added to env example (e.g. groq) so i can check if anything is off, shouldn't be
+- review it closer
