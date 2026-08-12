@@ -135,12 +135,12 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
     decision: RespondDecision = response.completion
 
     if decision.kind == "task":
-        print(f"\nrespond: task → planning :: {decision.reasoning}")
+        print(f"  respond → task")
         return Command(goto="plan")
 
     # a question / chat — answer it and go back to listening
     answer = decision.answer or "(no answer)"
-    print(f"\nrespond: {answer}")
+    print(f"  respond → {answer[:120]}{'…' if len(answer) > 120 else ''}")
     return Command(goto=END, update={"messages": [{"role": "assistant", "content": answer}]})
 
 # what the planner has to return: exactly one next action. kept deliberately
@@ -341,7 +341,7 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> PipelineSta
     response = await _ainvoke_with_retry(llm, [PLANNER_SYSTEM, user_msg], PlanDecision)
     decision: PlanDecision = response.completion
 
-    print(f"\nStep {step} — plan: {decision.action} :: {decision.reasoning}")
+    print(f"  [{step}] plan → {decision.action}")
     return {"last_decision": decision, "step": step}
 
 async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
@@ -387,20 +387,14 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
 
 
 async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan"]]:
-    # the CONSENSUS GATE: independently verify the planned action on two channels —
-    # the DOM (text) and the screenshot (vision) — before it runs. BOTH must approve
-    # to execute; disagreement (or either rejecting) sends it back to plan. falls back to DOM-only 
-    # if vision is off.
+    # verify before consequential actions (click, done). DOM is the decision;
+    # vision notes overlay issues but does not block when DOM already approved —
+    # otherwise a visible popup rejects a valid done answer and the agent loops.
     decision: PlanDecision = state["last_decision"]
 
-    # only bother verifying consequential actions — a click can submit/commit/
-    # navigate, and done claims completion. navigate/scroll/input are safe and
-    # reversible so we wave them through (skips the verifier calls, much faster)
     if decision.action not in ("click", "done"):
         return Command(goto="execute")
 
-    # a stable key for this exact proposed action, so we can tell if the planner
-    # keeps re-proposing something the gate already rejected.
     rej_key = f"(rejected: {decision.action} idx={decision.index} url={decision.url})"
 
     # rejection loop guard: if this exact action was already rejected once, the
@@ -410,7 +404,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     prior_rejections = [e for e in state.get("scratch", []) if e.get("action") == rej_key]
     if prior_rejections:
         last_reason = prior_rejections[-1].get("outcome", "the action was rejected repeatedly")
-        print("  analyse: ✗ same action rejected again — stopping to avoid a loop")
+        print("  analyse → stop (same action rejected twice)")
         stop = PlanDecision(
             reasoning="stuck: the gate rejected the same action repeatedly",
             action="done",
@@ -420,35 +414,33 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
         return Command(goto="execute", update={"last_decision": stop})
 
     session, _, _ = _resources(config)
-    # reuse the page the planner just read (cached); need the screenshot for vision
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
     dom_text = summary.dom_state.llm_representation()[:6000]
     progress = _format_scratch(state.get("scratch", []))
 
-    # run both channels
     dom_v = await _verify_dom(decision, state["query"], dom_text, progress,
                               summary.title, summary.url)
-    vis_v = await _verify_vision(decision, state["query"], progress, summary.screenshot)
+    # skip vision on done — the answer lives in DOM/text; overlays don't invalidate it
+    vis_v = None if decision.action == "done" else await _verify_vision(
+        decision, state["query"], progress, summary.screenshot,
+    )
 
-    if vis_v is None:
-        # vision unavailable -> single-channel (DOM only)
-        approved, reason = dom_v.approved, dom_v.reason
-        print(f"  analyse [DOM only]: {'✓ approved' if approved else '✗ rejected'} :: {reason}")
-    else:
-        # consensus: execute ONLY if both channels approve; disagreement blocks
-        agree = dom_v.approved == vis_v.approved
-        approved = dom_v.approved and vis_v.approved
-        d, v = ('✓' if dom_v.approved else '✗'), ('✓' if vis_v.approved else '✗')
-        print(f"  analyse [DOM={d} VISION={v} → {'AGREE' if agree else 'DISAGREE'}]"
-              f"{'' if approved else ' — replan'}")
-        print(f"    DOM:    {dom_v.reason}")
-        print(f"    VISION: {vis_v.reason}")
+    approved = dom_v.approved
+    tag = "✓" if approved else "✗"
+    note = dom_v.reason[:100]
+    if vis_v and not vis_v.approved and approved:
+        note += f" (vision: {vis_v.reason[:60]}…)"
+    elif vis_v and not vis_v.approved and not approved:
+        note = vis_v.reason[:100]
+    print(f"  analyse [{tag}] {decision.action}: {note}")
+
+    reason = dom_v.reason
+    if vis_v:
         reason = f"DOM: {dom_v.reason} | VISION: {vis_v.reason}"
 
     if approved:
         return Command(goto="execute")
 
-    # not approved — record why (keyed so the loop guard catches a repeat) and replan
     entry = {"action": rej_key, "outcome": f"gate rejected: {reason}"}
     return Command(goto="plan", update={"scratch": state.get("scratch", []) + [entry]})
 
@@ -471,15 +463,16 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> Pipeline
             text="stopped: the agent kept repeating the same action without making progress",
         ))
         action_dump = action.model_dump(exclude_unset=True)
+        action_name = next(iter(action_dump), "")
 
     result: ActionResult = await tools.act(
         action, session, file_system=file_system, page_extraction_llm=make_extraction_llm()
     )
     # done when the planner emitted a `done` action (browser-use sets is_done)
     done = bool(getattr(result, "is_done", False))
-    print(f"  doing:  {action.model_dump(exclude_unset=True)}")
+    print(f"  exec → {action_name or action_dump}")
     if getattr(result, "error", None):
-        print(f"  error:  {result.error}")
+        print(f"  exec error: {result.error}")
 
     # jot this action down in the within-task log so the next plan step sees it
     # read the page fresh so the outcome reflects where the action landed us
@@ -501,9 +494,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
     if finished:
         reason = "task done" if state.get("done") else f"hit MAX_STEPS ({MAX_STEPS})"
         answer = getattr(result, "extracted_content", None) or reason
-        print("── resolve ──────────────────────────────")
-        print(f"  finished: {reason}")
-        print(f"  result:   {answer}")
+        print(f"  done: {str(answer)[:120]}{'…' if len(str(answer)) > 120 else ''}")
         return Command(goto=END, update={
             "messages": [{"role": "assistant", "content": str(answer)}],
             "step": 0,

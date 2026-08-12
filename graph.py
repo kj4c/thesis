@@ -1,46 +1,28 @@
 # wiring the nodes into the langgraph state machine.
 
-from typing import TypedDict
-
 from langgraph.graph import StateGraph, START
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import RetryPolicy, TimeoutPolicy
-from langgraph.errors import NodeError
+from langgraph.types import RetryPolicy
 
 from state import PipelineState
 import nodes  # reference nodes.node_* so tests can monkeypatch them
 
+_RETRY = RetryPolicy(max_attempts=3)
 
-# TODO: define status & default error handler
-# START: error handling placeholder
-class State(TypedDict):
-    status: str
-
-def default_error_handler(state: State, error: NodeError) -> State:
-    return {"status": f"handled: {error.error}"}
-# END: error handling placeholder
 
 def build_workflow():
+    # same graph as build_agent(), with per-node retries. (TimeoutPolicy /
+    # set_node_defaults are from a newer langgraph API — not in 1.x yet.)
     g: StateGraph[PipelineState] = StateGraph(PipelineState)
-
-    g.set_node_defaults(
-        retry_policy=RetryPolicy(max_attempts=3),
-        error_handler=default_error_handler,
-        timeout=TimeoutPolicy(run_timeout=30),
-    )
-
-    g.add_node("respond", nodes.node_respond)
-    g.add_node("plan", nodes.node_plan)
-    g.add_node("analyse", nodes.node_analyse)
-    g.add_node("execute", nodes.node_execute)
-    g.add_node("resolve", nodes.node_resolve)
-
-    # conditional edges return the edge they go to
-    g.add_edge("START", "respond")
+    g.add_node("respond", nodes.node_respond, retry_policy=_RETRY)
+    g.add_node("plan", nodes.node_plan, retry_policy=_RETRY)
+    g.add_node("analyse", nodes.node_analyse, retry_policy=_RETRY)
+    g.add_node("execute", nodes.node_execute, retry_policy=_RETRY)
+    g.add_node("resolve", nodes.node_resolve, retry_policy=_RETRY)
+    g.add_edge(START, "respond")
     g.add_edge("plan", "analyse")
     g.add_edge("execute", "resolve")
-    memory = InMemorySaver()
-    return g.compile(checkpointer=memory)
+    return g.compile(checkpointer=InMemorySaver())
 
 # ── the actual agent loop (with chat memory) ─────────────────────────────────
 '''

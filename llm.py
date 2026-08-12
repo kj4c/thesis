@@ -66,6 +66,19 @@ def make_vision_llm():
     return _build_llm(VISION_PROVIDER, VISION_MODEL)
 
 
+# ── glasses POV input (independent of USE_VISION analyse gate) ───────────────
+GLASSES_VISION_PROVIDER = os.getenv("GLASSES_VISION_PROVIDER", "gemini").lower()
+GLASSES_VISION_MODEL = os.getenv(
+    "GLASSES_VISION_MODEL",
+    _VISION_DEFAULTS.get(GLASSES_VISION_PROVIDER, "gemini-2.0-flash"),
+)
+
+
+def make_glasses_vision_llm():
+    # always vision-capable — used to read the photo the glasses send in
+    return _build_llm(GLASSES_VISION_PROVIDER, GLASSES_VISION_MODEL)
+
+
 # ── extraction model (for the `extract` action) ──────────────────────────────
 # extract sends the WHOLE page to the model, so it needs a big context + generous
 # rate limit. the planner model can be too small. defaults to the vision model

@@ -5,7 +5,9 @@
 #                    "media_type": str,           (optional, default "unknown")
 #                    "media_data": base64 str,    (optional)
 #                    "filename": str}             (optional, for the extension)
-#            reply  {"status": "received", "id": <uuid>}
+#            reply  {"status": "success"|"error", "id": <uuid>,
+#                    "result": str,               (agent reply, on success)
+#                    "error": str}                (on failure)
 #
 # run with:  python serve.py            (defaults to 0.0.0.0:8765)
 #            GLASSES_PORT=9000 python serve.py
@@ -39,8 +41,9 @@ from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
 import llm
+from glasses_vision import enrich_prompt_with_image
 from graph import build_agent
-from mvp import run_turn
+from mvp import run_turn_with_result
 from state import _start_resources, _run_config
 
 DEFAULT_PORT = 8765
@@ -80,24 +83,6 @@ async def _register_mdns(port: int) -> AsyncZeroconf:
     return azc
 
 
-async def _worker(app: web.Application):
-    queue: asyncio.Queue = app["queue"]
-    workflow = app["workflow"]
-    config = app["config"]
-    while True:
-        item = await queue.get()
-        prompt = item["prompt"]
-        try:
-            print(f"[glasses] running: {prompt!r}")
-            start = time.perf_counter()
-            await run_turn(workflow, prompt, config)
-            print(f"[glasses] done in {time.perf_counter() - start:.1f}s")
-        except Exception as exc:  # keep the server alive on a bad turn
-            print(f"[glasses] task failed: {exc!r}")
-        finally:
-            queue.task_done()
-
-
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "port": request.app["port"]})
 
@@ -113,6 +98,7 @@ async def handle_data(request: web.Request) -> web.Response:
         return web.json_response({"error": "prompt is required"}, status=400)
 
     item_id = str(uuid.uuid4())
+    media_path: Path | None = None
 
     media_data = body.get("media_data")
     if media_data:
@@ -127,8 +113,37 @@ async def handle_data(request: web.Request) -> web.Response:
                 {"error": f"media decode failed: {exc}"}, status=400
             )
 
-    await request.app["queue"].put({"id": item_id, "prompt": prompt})
-    return web.json_response({"status": "received", "id": item_id})
+    agent_prompt = prompt
+    if media_path is not None:
+        try:
+            print("[glasses] analysing POV photo…")
+            agent_prompt = await enrich_prompt_with_image(media_path, prompt)
+            print(f"[glasses] vision context:\n{agent_prompt}\n")
+        except Exception as exc:
+            print(f"[glasses] vision failed ({exc!r}), using text prompt only")
+
+    workflow = request.app["workflow"]
+    config = request.app["config"]
+    lock: asyncio.Lock = request.app["lock"]
+
+    print(f"[glasses] running: {prompt!r}")
+    start = time.perf_counter()
+    async with lock:
+        try:
+            result = await run_turn_with_result(workflow, agent_prompt, config)
+        except Exception as exc:
+            print(f"[glasses] task failed: {exc!r}")
+            return web.json_response(
+                {"status": "error", "id": item_id, "error": str(exc)},
+                status=500,
+            )
+
+    elapsed = time.perf_counter() - start
+    print(f"[glasses] done in {elapsed:.1f}s")
+    print(f"[glasses] reply: {result[:200]}{'…' if len(result) > 200 else ''}")
+    return web.json_response(
+        {"status": "success", "id": item_id, "result": result}
+    )
 
 
 async def start_background(app: web.Application):
@@ -137,11 +152,11 @@ async def start_background(app: web.Application):
     app["session"] = session
     app["workflow"] = build_agent()
     app["config"] = _run_config(session, tools, file_system, THREAD_ID)
-    app["queue"] = asyncio.Queue()
-    app["worker"] = asyncio.create_task(_worker(app))
+    app["lock"] = asyncio.Lock()
     app["mdns"] = await _register_mdns(app["port"])
     print(f"planner: {llm.PLANNER_PROVIDER} / "
           f"{llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER, '?')}")
+    print(f"glasses vision: {llm.GLASSES_VISION_PROVIDER} / {llm.GLASSES_VISION_MODEL}")
 
 
 async def cleanup_background(app: web.Application):
@@ -149,11 +164,6 @@ async def cleanup_background(app: web.Application):
     if azc is not None:
         await azc.async_unregister_service(azc.info)
         await azc.async_close()
-    app["worker"].cancel()
-    try:
-        await app["worker"]
-    except asyncio.CancelledError:
-        pass
     print("closing browser…")
     await app["session"].kill()
 

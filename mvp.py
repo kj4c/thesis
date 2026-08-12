@@ -29,6 +29,19 @@ async def run_turn(workflow, query: str, config: RunnableConfig):
     )
 
 
+def last_assistant_reply(workflow, config: RunnableConfig) -> str:
+    msgs = workflow.get_state(config).values.get("messages", [])
+    for m in reversed(msgs):
+        if m.get("role") == "assistant":
+            return str(m.get("content", ""))
+    return "Task completed but no response was generated."
+
+
+async def run_turn_with_result(workflow, query: str, config: RunnableConfig) -> str:
+    await run_turn(workflow, query, config)
+    return last_assistant_reply(workflow, config)
+
+
 async def run_once(query: str, thread_id: str = "1"):
     # single-shot: one prompt, then tear down. handy for non-interactive tests.
     session, tools, file_system = await _start_resources()
