@@ -5,19 +5,15 @@
 //  Created by Khye Jac Low on 17/6/2026.
 //
 import SwiftUI
+import Combine
 import CoreBluetooth
 import MWDATCore
 import MWDATCamera
 import AVFoundation
 import Speech
 
-//struct BrainResponse: Codable {
-//    let status: String
-//    let agent_task_executed: String
-//    let final_result: String?
-//}
+// MARK: - Backend + speech (shared with Siri intents in GlassesAgentIntent.swift)
 
-// MARK: - Updated Response Model
 struct BrainResponse: Codable {
     let status: String?
     let id: String?
@@ -25,112 +21,290 @@ struct BrainResponse: Codable {
     let error: String?
 }
 
+extension Notification.Name {
+    static let glassesAgentRun = Notification.Name("glassesAgentRun")
+    static let glassesAgentFollowUp = Notification.Name("glassesAgentFollowUp")
+}
+
+enum GlassesAgentKeys {
+    static let prompt = "prompt"
+    static let converse = "startConversation"
+}
+
+@MainActor
+final class AgentService: ObservableObject {
+    static let shared = AgentService()
+
+    // HOME — update when your Mac IP changes
+    var host = "192.168.0.138"
+    // EDUROM: "10.4.165.59"
+    // HOTSPOT: "172.20.10.4"
+    var port = "8765"
+
+    @Published var status = ""
+    @Published var isProcessing = false
+    @Published var conversationActive = false
+
+    private let synthesizer = AVSpeechSynthesizer()
+
+    func runWithPhoto(image: UIImage, prompt: String) async -> String {
+        isProcessing = true
+        status = "Running agent…"
+        defer { isProcessing = false }
+
+        let reply = await postToBackend(prompt: prompt, image: image)
+        status = reply
+        speak(reply)
+        return reply
+    }
+
+    func sendFollowUp(_ prompt: String) async -> String {
+        isProcessing = true
+        status = "Thinking…"
+        defer { isProcessing = false }
+
+        let reply = await postToBackend(prompt: prompt, image: nil)
+        status = reply
+        speak(reply)
+        return reply
+    }
+
+    func runConversationLoop(onTranscribe: @escaping (URL) async -> String?) async {
+        conversationActive = true
+        defer { conversationActive = false }
+
+        speak("Anything else? Say stop when you're done.")
+
+        while conversationActive {
+            guard let audioURL = await recordAudio(seconds: 5) else {
+                status = "Mic unavailable."
+                break
+            }
+            guard let text = await onTranscribe(audioURL), !text.isEmpty else { continue }
+
+            let lower = text.lowercased()
+            if lower.contains("stop") || lower.contains("goodbye") || lower.contains("that's all") {
+                speak("Okay, talk later.")
+                status = "Conversation ended."
+                break
+            }
+
+            _ = await sendFollowUp(text)
+        }
+    }
+
+    func stopConversation() {
+        conversationActive = false
+        synthesizer.stopSpeaking(at: .immediate)
+    }
+
+    func speak(_ text: String) {
+        synthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        synthesizer.speak(utterance)
+    }
+
+    func recordAudio(seconds: UInt64 = 4) async -> URL? {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .defaultToSpeaker])
+            try session.setActive(true)
+        } catch {
+            print("Audio session error: \(error)")
+            return nil
+        }
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("voice_\(UUID().uuidString).m4a")
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
+        ]
+
+        do {
+            let recorder = try AVAudioRecorder(url: url, settings: settings)
+            recorder.record()
+            try await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            recorder.stop()
+            return url
+        } catch {
+            print("Recorder error: \(error)")
+            return nil
+        }
+    }
+
+    private func postToBackend(prompt: String, image: UIImage?) async -> String {
+        let url = URL(string: "http://\(host):\(port)/data")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        var payload: [String: Any] = ["prompt": prompt]
+        if let image, let data = image.jpegData(compressionQuality: 0.8) {
+            payload["media_data"] = data.base64EncodedString()
+            payload["media_type"] = "image"
+            payload["filename"] = "pic.jpg"
+        }
+
+        do {
+            let json = try JSONSerialization.data(withJSONObject: payload)
+            let (data, response) = try await URLSession.shared.upload(for: request, from: json)
+
+            if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                let body = String(data: data, encoding: .utf8) ?? ""
+                print("HTTP \(http.statusCode): \(body)")
+            }
+
+            let brain = try JSONDecoder().decode(BrainResponse.self, from: data)
+            if brain.status == "error" || brain.error != nil {
+                return "Error: \(brain.error ?? "Unknown error")"
+            }
+            if let result = brain.result, !result.isEmpty { return result }
+            return "Done."
+        } catch {
+            print("Network error: \(error)")
+            return "Network error or timeout."
+        }
+    }
+}
+
+// MARK: - ContentView
+
 struct ContentView: View {
-    // MARK: - SDK state (mirrors the sample app)
+    @ObservedObject private var agent = AgentService.shared
+
+    // MARK: - SDK state
     @State private var registrationState: RegistrationState = .unavailable
     @State private var cameraPermission: PermissionStatus = .denied
     @State private var deviceIds: [DeviceIdentifier] = []
     @State private var errorMessage: String?
-    
+
     // MARK: - UI state
     @State private var connectionStatus: String = "Disconnected"
     @State private var capturedImage: UIImage? = nil
     @State private var isProcessing: Bool = false
-    
-    // Keep the listeners / session / stream alive across the async capture.
+
     @State private var photoSubscription: Any? = nil
     @State private var streamErrorSubscription: Any? = nil
     @State private var activeSession: DeviceSession? = nil
     @State private var activeStream: MWDATCamera.Stream? = nil
-    
-    // Triggers the native Bluetooth permission dialog at launch.
+
     @State private var bluetoothManager = CBCentralManager(delegate: nil, queue: nil)
-    
-    // True while we've bounced out to the Meta AI app and are waiting to come back.
     @State private var awaitingMetaAI = false
-    // Counts how many callback URLs Meta AI has actually delivered to us.
     @State private var callbackCount = 0
-    // Whether the debug/diagnostics panel is visible.
     @State private var showDebug = false
-    @State private var synthesizer = AVSpeechSynthesizer()
     @Environment(\.scenePhase) private var scenePhase
-    
+
+    // Siri queue — set when Hey Siri launches the app
+    @State private var siriPendingPrompt: String?
+    @State private var siriStartConversation = false
+
     private let wearables = Wearables.shared
-    
+    private let defaultSiriPrompt = "Find this product and tell me the price"
+
     private var isRegistered: Bool { registrationState == .registered }
     private var hasCamera: Bool { cameraPermission == .granted }
-    
-    
+    private var busy: Bool { isProcessing || agent.isProcessing }
+    private var displayStatus: String {
+        if !agent.status.isEmpty && (agent.isProcessing || agent.conversationActive) {
+            return agent.status
+        }
+        return connectionStatus
+    }
+
     var body: some View {
-            // 👈 1. WE ADD A SCROLLVIEW HERE
-            ScrollView {
-                VStack(spacing: 20) {
-                    
-                    // Header is pushed to the top
-                    header
-                        .padding(.top, 20)
-                    
-                    // The massive image card
-                    previewCard
-                    
-                    // Status text safely outside the image
-                    Text(connectionStatus)
-                        .font(.headline)
-                        .foregroundColor(connectionStatus.contains("❌") ? .red : .primary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal)
-                    
-                    statusAndError
-                    
-                    if showDebug {
-                        debugPanel
-                    }
-                    
-                    // 👈 2. Add minLength so it doesn't collapse in the scroll view
-                    Spacer(minLength: 30)
-                    
-                    // Buttons anchored at the bottom
-                    buttonStack
-                        .padding(.bottom, 40) // Extra padding so it clears the home bar
+        ScrollView {
+            VStack(spacing: 20) {
+                header
+                    .padding(.top, 20)
+
+                previewCard
+
+                Text(displayStatus)
+                    .font(.headline)
+                    .foregroundColor(displayStatus.contains("❌") || displayStatus.contains("Error:") ? .red : .primary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal)
+
+                if agent.conversationActive {
+                    Text("Listening for follow-ups — say \"stop\" to end")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 20)
-            }
-            .background(Color(.systemBackground).ignoresSafeArea())
-            .onOpenURL { url in
-                handleMetaCallback(url: url)
-            }
-            .onChange(of: scenePhase) { _, phase in
-                guard phase == .active else { return }
-                if awaitingMetaAI {
-                    awaitingMetaAI = false
-                    Task { await refreshAfterMetaAI() }
-                } else {
-                    deviceIds = wearables.devices
+
+                statusAndError
+
+                if showDebug {
+                    debugPanel
                 }
+
+                Spacer(minLength: 30)
+
+                buttonStack
+                    .padding(.bottom, 40)
             }
-            .task {
-                registrationState = wearables.registrationState
+            .padding(.horizontal, 20)
+        }
+        .background(Color(.systemBackground).ignoresSafeArea())
+        .onOpenURL { url in
+            handleMetaCallback(url: url)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            if awaitingMetaAI {
+                awaitingMetaAI = false
+                Task { await refreshAfterMetaAI() }
+            } else {
                 deviceIds = wearables.devices
-                await checkCameraPermission()
-                
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask {
-                        for await ids in wearables.devicesStream() {
-                            await MainActor.run { self.deviceIds = ids }
-                        }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glassesAgentRun)) { note in
+            let prompt = note.userInfo?[GlassesAgentKeys.prompt] as? String ?? defaultSiriPrompt
+            let converse = note.userInfo?[GlassesAgentKeys.converse] as? Bool ?? true
+            siriPendingPrompt = prompt
+            siriStartConversation = converse
+            connectionStatus = "Siri request — preparing…"
+            if capturedImage != nil {
+                Task { await runSiriCommand(prompt: prompt, converse: converse) }
+            } else if hasCamera && !deviceIds.isEmpty {
+                snapGlassesPhoto()
+            } else {
+                connectionStatus = "Connect glasses and allow camera first, then try Siri again."
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glassesAgentFollowUp)) { note in
+            guard let prompt = note.userInfo?[GlassesAgentKeys.prompt] as? String else { return }
+            Task {
+                let reply = await agent.sendFollowUp(prompt)
+                connectionStatus = reply
+            }
+        }
+        .task {
+            registrationState = wearables.registrationState
+            deviceIds = wearables.devices
+            await checkCameraPermission()
+
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await ids in wearables.devicesStream() {
+                        await MainActor.run { self.deviceIds = ids }
                     }
-                    group.addTask {
-                        for await state in wearables.registrationStateStream() {
-                            await MainActor.run { self.registrationState = state }
-                        }
+                }
+                group.addTask {
+                    for await state in wearables.registrationStateStream() {
+                        await MainActor.run { self.registrationState = state }
                     }
                 }
             }
         }
-    
-    // MARK: - Layout pieces
-    
+    }
+
+    // MARK: - Layout
+
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
@@ -148,7 +322,7 @@ struct ContentView: View {
             .accessibilityLabel("Toggle debug info")
         }
     }
-    
+
     @ViewBuilder
     private var previewCard: some View {
         ZStack {
@@ -156,20 +330,19 @@ struct ContentView: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: 450) // 👈 Takes up massive space now
+                    .frame(maxWidth: .infinity, maxHeight: 450)
                     .clipShape(RoundedRectangle(cornerRadius: 24))
             } else {
                 RoundedRectangle(cornerRadius: 24)
                     .fill(Color(.secondarySystemBackground))
                     .frame(maxWidth: .infinity, minHeight: 250, maxHeight: 450)
-                
-                Image(systemName: isProcessing ? "camera.aperture" : "camera.fill")
+
+                Image(systemName: busy ? "camera.aperture" : "camera.fill")
                     .font(.system(size: 52))
                     .foregroundStyle(.blue)
             }
-            
-            // Loading spinner overlay
-            if isProcessing {
+
+            if busy {
                 ZStack {
                     RoundedRectangle(cornerRadius: 24).fill(Color.black.opacity(0.3))
                     ProgressView().controlSize(.large).tint(.white)
@@ -178,7 +351,7 @@ struct ContentView: View {
             }
         }
     }
-    
+
     @ViewBuilder
     private var statusAndError: some View {
         if let errorMessage {
@@ -191,13 +364,15 @@ struct ContentView: View {
                 .padding(.horizontal, 4)
         }
     }
-    
+
     private var debugPanel: some View {
         VStack(spacing: 4) {
             debugRow("Registration", registrationState.description)
             debugRow("Camera", hasCamera ? "granted" : "not granted")
             debugRow("Devices", "\(deviceIds.count)")
             debugRow("Meta AI callbacks", "\(callbackCount)")
+            debugRow("Conversation", agent.conversationActive ? "active" : "off")
+            debugRow("Backend", "\(agent.host):\(agent.port)")
         }
         .font(.caption.monospaced())
         .padding(12)
@@ -205,32 +380,40 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
-    
+
     private var buttonStack: some View {
         VStack(spacing: 12) {
             actionButton("Connect to Glasses", systemImage: "link", color: .blue,
-                         disabled: isProcessing, done: isRegistered) {
+                         disabled: busy, done: isRegistered) {
                 connectToMetaAI()
             }
             actionButton("Allow Camera Access", systemImage: "camera.badge.ellipsis", color: .orange,
-                         disabled: isProcessing || !isRegistered, done: hasCamera) {
+                         disabled: busy || !isRegistered, done: hasCamera) {
                 requestCameraPermission()
             }
             let readyToSnap = hasCamera && !deviceIds.isEmpty
             actionButton("Snap POV Photo", systemImage: "camera.fill", color: .green,
-                         disabled: isProcessing || !readyToSnap, done: false) {
+                         disabled: busy || !readyToSnap, done: false) {
                 snapGlassesPhoto()
             }
-            
+
             if capturedImage != nil {
                 actionButton("Run AI Command", systemImage: "sparkles", color: .purple,
-                             disabled: isProcessing, done: false) {
-                    runAICommand()
+                             disabled: busy, done: false) {
+                    runAICommand(startConversation: true)
+                }
+            }
+
+            if agent.conversationActive {
+                actionButton("Stop Conversation", systemImage: "stop.circle.fill", color: .red,
+                             disabled: false, done: false) {
+                    agent.stopConversation()
+                    connectionStatus = "Conversation stopped."
                 }
             }
         }
     }
-    
+
     @ViewBuilder
     private func actionButton(_ title: String, systemImage: String, color: Color,
                               disabled: Bool, done: Bool,
@@ -248,7 +431,7 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .disabled(disabled)
     }
-    
+
     @ViewBuilder
     private func debugRow(_ label: String, _ value: String) -> some View {
         HStack {
@@ -257,12 +440,13 @@ struct ContentView: View {
             Text(value).foregroundStyle(.primary)
         }
     }
-    
-    // MARK: - Speech Transcription Helper
+
+    // MARK: - Speech
+
     func transcribeAudio(url: URL) async -> String? {
         await withCheckedContinuation { continuation in
-            var didResume = false // Safety flag to prevent crashes
-            
+            var didResume = false
+
             SFSpeechRecognizer.requestAuthorization { status in
                 guard status == .authorized,
                       let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")),
@@ -270,17 +454,17 @@ struct ContentView: View {
                     if !didResume { didResume = true; continuation.resume(returning: nil) }
                     return
                 }
-                
+
                 let request = SFSpeechURLRecognitionRequest(url: url)
-                request.shouldReportPartialResults = false // 👈 Forces it to just give the final answer
-                
+                request.shouldReportPartialResults = false
+
                 recognizer.recognitionTask(with: request) { result, error in
                     if let error = error {
                         print("Speech error: \(error)")
                         if !didResume { didResume = true; continuation.resume(returning: nil) }
                         return
                     }
-                    
+
                     if let result = result, result.isFinal {
                         if !didResume {
                             didResume = true
@@ -291,14 +475,15 @@ struct ContentView: View {
             }
         }
     }
-    
+
     // MARK: - Registration
+
     func connectToMetaAI() {
         isProcessing = true
         awaitingMetaAI = true
         errorMessage = nil
         connectionStatus = "Opening Meta AI..."
-        
+
         Task {
             do {
                 try await wearables.startRegistration()
@@ -316,20 +501,20 @@ struct ContentView: View {
             }
         }
     }
-    
+
     func handleMetaCallback(url: URL) {
         awaitingMetaAI = false
         callbackCount += 1
         print("📲 Meta AI callback URL received (#\(callbackCount)): \(url)")
         connectionStatus = "Verifying link..."
-        
+
         let query = url.query ?? ""
         let isPermissionCallback = query.contains("metaWearablesAction=requestPermission")
         let permissionGranted = query.contains("permission_granted=true")
-        
+
         Task {
             _ = try? await wearables.handleUrl(url)
-            
+
             if isPermissionCallback {
                 await MainActor.run {
                     self.cameraPermission = permissionGranted ? .granted : .denied
@@ -347,7 +532,7 @@ struct ContentView: View {
             }
         }
     }
-    
+
     func refreshAfterMetaAI() async {
         if !hasCamera { await checkCameraPermission() }
         await MainActor.run {
@@ -363,8 +548,7 @@ struct ContentView: View {
             }
         }
     }
-    
-    // MARK: - Camera permission (mirrors the sample app)
+
     func checkCameraPermission() async {
         do {
             let status = try await wearables.checkPermissionStatus(.camera)
@@ -373,25 +557,25 @@ struct ContentView: View {
             await MainActor.run { self.cameraPermission = .denied }
         }
     }
-    
+
     func requestCameraPermission() {
         isProcessing = true
         awaitingMetaAI = true
         errorMessage = nil
         connectionStatus = "Requesting camera permission in Meta AI..."
-        
+
         Task {
             _ = try? await wearables.requestPermission(.camera)
         }
     }
-    
+
     // MARK: - Capture
+
     func snapGlassesPhoto() {
         isProcessing = true
         errorMessage = nil
         connectionStatus = "Looking for glasses..."
-        
-        // 🧹 1. NUKE PREVIOUS ZOMBIE SESSIONS
+
         photoSubscription = nil
         streamErrorSubscription = nil
         activeStream = nil
@@ -399,7 +583,7 @@ struct ContentView: View {
             oldSession.stop()
             activeSession = nil
         }
-        
+
         Task {
             do {
                 guard hasCamera else {
@@ -409,11 +593,11 @@ struct ContentView: View {
                     }
                     return
                 }
-                
+
                 if wearables.devices.isEmpty {
                     _ = await waitForDevice(timeout: 30)
                 }
-                
+
                 guard let deviceId = wearables.devices.first else {
                     await MainActor.run {
                         self.isProcessing = false
@@ -422,14 +606,14 @@ struct ContentView: View {
                     }
                     return
                 }
-                
+
                 await MainActor.run { self.connectionStatus = "Starting stream..." }
-                
+
                 let selector = SpecificDeviceSelector(device: deviceId)
                 let session = try wearables.createSession(deviceSelector: selector)
                 self.activeSession = session
                 try session.start()
-                
+
                 await MainActor.run { self.connectionStatus = "Connecting to glasses camera..." }
                 guard await waitForSessionStarted(session, timeout: 15) else {
                     await MainActor.run {
@@ -439,7 +623,7 @@ struct ContentView: View {
                     }
                     return
                 }
-                
+
                 let config = StreamConfiguration()
                 guard let stream = try session.addStream(config: config) else {
                     await MainActor.run {
@@ -449,20 +633,28 @@ struct ContentView: View {
                     return
                 }
                 self.activeStream = stream
-                
+
                 photoSubscription = stream.photoDataPublisher.listen { photoData in
                     if let uiImage = UIImage(data: photoData.data) {
                         Task { @MainActor in
                             self.capturedImage = uiImage
-                            self.connectionStatus = "Photo success! Tap Run AI Command."
                             self.isProcessing = false
                             session.stop()
                             self.activeStream = nil
                             self.activeSession = nil
+
+                            // Siri: auto-run after snap
+                            if let prompt = self.siriPendingPrompt {
+                                let converse = self.siriStartConversation
+                                self.siriPendingPrompt = nil
+                                Task { await self.runSiriCommand(prompt: prompt, converse: converse) }
+                            } else {
+                                self.connectionStatus = "Photo success! Tap Run AI Command."
+                            }
                         }
                     }
                 }
-                
+
                 streamErrorSubscription = stream.errorPublisher.listen { streamError in
                     Task { @MainActor in
                         self.isProcessing = false
@@ -471,7 +663,7 @@ struct ContentView: View {
                         print("Stream Error: \(streamError)")
                     }
                 }
-                
+
                 await stream.start()
                 await MainActor.run { self.connectionStatus = "Connecting camera feed..." }
                 guard await waitForStreaming(stream, timeout: 15) else {
@@ -482,10 +674,10 @@ struct ContentView: View {
                     }
                     return
                 }
-                
+
                 await MainActor.run { self.connectionStatus = "Waking up sensor..." }
-                try? await Task.sleep(nanoseconds: 1_500_000_000) // 1.5 second delay
-                
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+
                 await MainActor.run { self.connectionStatus = "Capturing..." }
                 let didRequest = stream.capturePhoto(format: .jpeg)
                 if !didRequest {
@@ -495,7 +687,7 @@ struct ContentView: View {
                     }
                     return
                 }
-                
+
                 Task {
                     try? await Task.sleep(nanoseconds: 12_000_000_000)
                     await MainActor.run {
@@ -506,15 +698,13 @@ struct ContentView: View {
                         }
                     }
                 }
-                
+
             } catch {
                 await MainActor.run {
                     self.isProcessing = false
                     self.connectionStatus = "Camera error."
                     self.errorMessage = error.localizedDescription
                     print("Pipeline Error Trace: \(error)")
-                    
-                    // 🧹 3. CLEANUP ON ERROR
                     self.activeSession?.stop()
                     self.activeSession = nil
                     self.activeStream = nil
@@ -522,7 +712,7 @@ struct ContentView: View {
             }
         }
     }
-    
+
     private func waitForDevice(timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -531,7 +721,7 @@ struct ContentView: View {
         }
         return !wearables.devices.isEmpty
     }
-    
+
     private func waitAndRefreshDevices() async {
         let found = await waitForDevice(timeout: 20)
         await MainActor.run {
@@ -544,7 +734,7 @@ struct ContentView: View {
             }
         }
     }
-    
+
     private func waitForSessionStarted(_ session: DeviceSession, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -557,7 +747,7 @@ struct ContentView: View {
         }
         return session.state == .started
     }
-    
+
     private func waitForStreaming(_ stream: MWDATCamera.Stream, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -570,136 +760,52 @@ struct ContentView: View {
         }
         return stream.state == .streaming
     }
-    
-    // MARK: - 🧠 THE BRAIN BRIDGE
-    
-    func runAICommand() {
-            guard let image = capturedImage else { return }
-            
-            isProcessing = true
-            connectionStatus = "🎙️ Listening for 4 secs... Yap now!"
-            
-            Task {
-                if let audioURL = await startRecordingAudio() {
-                    await MainActor.run { self.connectionStatus = "✍️ Transcribing voice..." }
-                    
-                    // Transcribe audio to text string for the required `prompt` field
-                    let promptText = await transcribeAudio(url: audioURL) ?? "Search for items in image"
-                    
-                    await MainActor.run { self.connectionStatus = "🚀 Running agent..." }
-                    await sendToBackend(image: image, promptText: promptText)
-                } else {
-                    await MainActor.run {
-                        self.connectionStatus = "❌ Mic failed."
-                        self.isProcessing = false
-                    }
+
+    // MARK: - Agent + Siri
+
+    func runAICommand(startConversation: Bool = true) {
+        guard let image = capturedImage else { return }
+        Task {
+            connectionStatus = "🎙️ Listening for 4 secs…"
+            if let audioURL = await agent.recordAudio(seconds: 4) {
+                connectionStatus = "✍️ Transcribing…"
+                let promptText = await transcribeAudio(url: audioURL) ?? "Search for items in image"
+                connectionStatus = "🚀 Running agent…"
+                let reply = await agent.runWithPhoto(image: image, prompt: promptText)
+                connectionStatus = reply
+                if startConversation {
+                    await agent.runConversationLoop(onTranscribe: transcribeAudio)
+                    connectionStatus = agent.status
                 }
+            } else {
+                connectionStatus = "❌ Mic failed."
             }
-        }
-    
-    func startRecordingAudio() async -> URL? {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth])
-            try session.setActive(true)
-        } catch {
-            print("Audio session caught an L: \(error)")
-            return nil
-        }
-        
-        let audioFileURL = FileManager.default.temporaryDirectory.appendingPathComponent("voice_command.m4a")
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 16000,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
-        ]
-        
-        do {
-            let recorder = try AVAudioRecorder(url: audioFileURL, settings: settings)
-            recorder.record()
-            
-            try await Task.sleep(nanoseconds: 4_000_000_000)
-            recorder.stop()
-            return audioFileURL
-        } catch {
-            print("Recorder failed: \(error)")
-            return nil
         }
     }
-    
-    func speakResult(_ text: String) {
-        synthesizer.stopSpeaking(at: .immediate)
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        synthesizer.speak(utterance)
-    }
 
-    // MARK: - Updated JSON Network Call
-    func sendToBackend(image: UIImage, promptText: String) async {
-        // Adjust endpoint URL if needed
-        // HOME
-        let URL_ENDPOINT = "192.168.0.138"
-        // EDUROM
-//        let URL_ENDPOINT = "10.4.165.59"
-        // HOTSPOT
-//        let URL_ENDPOINT = "172.20.10.4"
-        let URL_PORT = "8765"
-        
-        let url = URL(string: "http://\(URL_ENDPOINT):\(URL_PORT)/data")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 180
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        guard let imageData = image.jpegData(compressionQuality: 0.8) else {
-            await MainActor.run {
-                self.isProcessing = false
-                self.connectionStatus = "❌ Failed to compress image."
+    func runSiriCommand(prompt: String, converse: Bool) async {
+        guard let image = capturedImage else { return }
+
+        connectionStatus = "🎙️ Listening…"
+        let voicePrompt: String
+        if prompt.isEmpty || prompt == defaultSiriPrompt {
+            if let audio = await agent.recordAudio(seconds: 4),
+               let text = await transcribeAudio(url: audio), !text.isEmpty {
+                voicePrompt = text
+            } else {
+                voicePrompt = prompt.isEmpty ? defaultSiriPrompt : prompt
             }
-            return
+        } else {
+            voicePrompt = prompt
         }
-        
-        let base64Image = imageData.base64EncodedString()
-        
-        // Exact JSON keys expected by handle_data
-        let payload: [String: Any] = [
-            "prompt": promptText,
-            "media_data": base64Image,
-            "media_type": "image",
-            "filename": "pic.jpg"
-        ]
-        
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: payload)
-            let (data, response) = try await URLSession.shared.upload(for: request, from: jsonData)
 
-            if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                print("HTTP \(http.statusCode): \(body)")
-            }
+        connectionStatus = "🚀 Running agent…"
+        let reply = await agent.runWithPhoto(image: image, prompt: voicePrompt)
+        connectionStatus = reply
 
-            let brainData = try JSONDecoder().decode(BrainResponse.self, from: data)
-
-            await MainActor.run {
-                self.isProcessing = false
-                if brainData.status == "error" || brainData.error != nil {
-                    self.connectionStatus = "❌ Error: \(brainData.error ?? "Unknown error")"
-                } else if let result = brainData.result, !result.isEmpty {
-                    self.connectionStatus = result
-                    self.speakResult(result)
-                } else if let itemId = brainData.id {
-                    self.connectionStatus = "✅ Done (ID: \(itemId.prefix(8))...)"
-                } else {
-                    self.connectionStatus = "✅ Task received."
-                }
-            }
-        } catch {
-            await MainActor.run {
-                self.isProcessing = false
-                self.connectionStatus = "❌ Network error or timeout."
-                print("Network error: \(error)")
-            }
+        if converse {
+            await agent.runConversationLoop(onTranscribe: transcribeAudio)
+            connectionStatus = agent.status
         }
     }
 }
