@@ -3,6 +3,7 @@
 # node_* functions below, but left in as the design sketch).
 
 from typing import Literal, Any
+import re
 
 from pydantic import BaseModel, Field
 from langgraph.graph import END
@@ -16,6 +17,7 @@ from browser_use.llm.messages import (
 
 from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry
 from state import PipelineState, MAX_STEPS, _resources
+from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
 # ── Node 1: Conversational Node  ─────────────────────────────────────────────
 '''
@@ -100,17 +102,14 @@ class RespondDecision(BaseModel):
 
 
 RESPOND_SYSTEM = SystemMessage(content=(
-    "You are the front desk of a browser assistant. Look at the user's message "
-    "(with the conversation so far and the current page) and decide:\n"
-    "- kind='task' if they want you to DO something in the browser — search, "
-    "navigate, click, buy, fill a form, add to cart, etc. Don't answer it "
-    "yourself; the browser agent will handle it.\n"
-    "- kind='answer' if it's something you can answer directly — a question about "
-    "the current page ('what's on this page', 'where's the search bar'), or "
-    "general chat. Put your reply in `answer`, using the current page and the "
-    "conversation as context.\n"
-    "If it sounds like an action, prefer task; if it sounds like a question, "
-    "prefer answer."
+    "You are the front desk of a browser assistant for smart glasses. The user "
+    "hears your reply spoken aloud — keep it SHORT.\n"
+    "- kind='task' if they want you to DO something in the browser: search, find a "
+    "price, navigate, click, buy, etc. ALWAYS use task for price/cost/find/on Amazon "
+    "requests — never try to answer those yourself from a stale page.\n"
+    "- kind='answer' ONLY for quick factual questions already fully answered on the "
+    "current page. Put the reply in `answer` — ONE short sentence max, no preamble.\n"
+    "When in doubt, prefer task."
 ))
 
 
@@ -151,7 +150,7 @@ class PlanDecision(BaseModel):
     action: Literal["navigate", "click", "input", "scroll", "extract", "done"]
     url: str | None = Field(default=None, description="for navigate: the URL to open")
     index: int | None = Field(default=None, description="for click/input: the [index] of the element")
-    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: the answer/result")
+    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: the answer — for prices use ONLY e.g. '$54.99'")
     down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
 
 
@@ -170,7 +169,15 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "- extract: read the CURRENT page for a fact — set `text` to what you want "
     "(e.g. 'cheapest spoon price and product name'). Use this instead of scrolling "
     "around to hunt for information.\n"
-    "- done: set `text` to the final answer/result for the user.\n\n"
+    "- done: set `text` to the final answer. For PRICE tasks: ONLY `$54.99` or "
+    "`$54.99 (different brand)` if the listing isn't the same brand as the user's "
+    "photo. One line max — no extra commentary.\n\n"
+    "PRICE / FIND TASKS — be fast (3–4 steps max):\n"
+    "- On search results: ONE extract for the first listed price, then done. STOP.\n"
+    "- Do NOT click into product pages, re-extract, or scroll for price-only tasks.\n"
+    "- If the first result is a different brand, still done with `$price (different brand)` "
+    "— do NOT keep searching.\n"
+    "- If actions-taken already shows an extract with a $ price, choose done immediately.\n\n"
     "SEARCHING THE WEB — Google is the default. To find or look something up, "
     "navigate DIRECTLY to a Google search URL in one step: "
     "https://www.google.com/search?q=<your+query+with+plus+signs>. Don't go to "
@@ -232,10 +239,9 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "REDUNDANT (it or an equivalent already appears in the actions-taken list). "
     "Never reject just because more steps remain.\n"
     "- `done`: decide by TASK TYPE.\n"
-    "  • FIND / ANSWER task (e.g. 'find the cheapest spoon', 'what's the price'): "
-    "APPROVE if the requested information is present on the current page or already "
-    "stated in the done text. No click or committing action is required — reading "
-    "the page IS the completion.\n"
+    "  • FIND / PRICE task: APPROVE done if it contains a $ price OR a prior extract "
+    "found one. Wrong brand is OK — the reply will note `(different brand)`. "
+    "Do NOT reject and send the agent searching again for brand match.\n"
     "  • DO / ACTION task (e.g. 'add to cart', 'submit', 'log in'): APPROVE if the "
     "actions-taken list already contains the completing action run WITHOUT error "
     "(e.g. an 'Add to bag' click). Do NOT require a visible confirmation — those are "
@@ -395,21 +401,31 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     if decision.action not in ("click", "done"):
         return Command(goto="execute")
 
+    query = state.get("query", "")
+
+    # price found in done text — skip slow verifier LLM call
+    if decision.action == "done" and price_from_text(decision.text or ""):
+        print("  analyse [✓] done: price in answer")
+        return Command(goto="execute")
+
     rej_key = f"(rejected: {decision.action} idx={decision.index} url={decision.url})"
 
-    # rejection loop guard: if this exact action was already rejected once, the
-    # planner is ignoring the feedback and spinning (plan→analyse→plan…). the
-    # execute-stage loop guard can't catch this because a rejected action never
-    # reaches execute. stop cleanly instead of looping to MAX_STEPS.
     prior_rejections = [e for e in state.get("scratch", []) if e.get("action") == rej_key]
     if prior_rejections:
+        # if we already have a price from extract, return it instead of erroring
+        for e in reversed(state.get("scratch", [])):
+            raw = str(e.get("outcome", ""))
+            if p := price_from_text(raw):
+                answer = compact_glasses_reply(query, raw)
+                print(f"  analyse → stop, using price {answer}")
+                stop = PlanDecision(reasoning="returning best price found", action="done", text=answer)
+                return Command(goto="execute", update={"last_decision": stop})
         last_reason = prior_rejections[-1].get("outcome", "the action was rejected repeatedly")
         print("  analyse → stop (same action rejected twice)")
         stop = PlanDecision(
             reasoning="stuck: the gate rejected the same action repeatedly",
             action="done",
-            text=(f"couldn't complete this — {last_reason}. "
-                  f"try rephrasing, or point me at a specific product/page."),
+            text=f"couldn't find a price — {last_reason[:80]}",
         )
         return Command(goto="execute", update={"last_decision": stop})
 
@@ -418,11 +434,12 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     dom_text = summary.dom_state.llm_representation()[:6000]
     progress = _format_scratch(state.get("scratch", []))
 
-    dom_v = await _verify_dom(decision, state["query"], dom_text, progress,
+    dom_v = await _verify_dom(decision, query, dom_text, progress,
                               summary.title, summary.url)
-    # skip vision on done — the answer lives in DOM/text; overlays don't invalidate it
-    vis_v = None if decision.action == "done" else await _verify_vision(
-        decision, state["query"], progress, summary.screenshot,
+    # skip vision for done and for price tasks (saves ~2s per step, fewer overlay loops)
+    skip_vision = decision.action == "done" or is_price_task(query)
+    vis_v = None if skip_vision else await _verify_vision(
+        decision, query, progress, summary.screenshot,
     )
 
     approved = dom_v.approved
@@ -455,6 +472,26 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> Pipeline
     action_dump = action.model_dump(exclude_unset=True)
     action_name = next(iter(action_dump), "")
     repeats = sum(1 for e in state.get("scratch", []) if e.get("action") == action_dump)
+
+    # price task: if extract already returned a price, stop re-extracting
+    query = state.get("query", "")
+    if action_name == "extract" and is_price_task(query):
+        for e in state.get("scratch", []):
+            if "extract" not in str(e.get("action", "")):
+                continue
+            raw = str(e.get("outcome", ""))
+            if price_from_text(raw):
+                answer = compact_glasses_reply(query, raw)
+                print(f"  ⚠ already have price, finishing: {answer}")
+                action = _decision_to_action(tools, PlanDecision(
+                    reasoning="extract already found a price",
+                    action="done",
+                    text=answer,
+                ))
+                action_dump = action.model_dump(exclude_unset=True)
+                action_name = "done"
+                break
+
     if action_name != "scroll" and repeats >= 2:
         print(f"  ⚠ loop guard: '{action_name}' repeated {repeats + 1}×, stopping")
         action = _decision_to_action(tools, PlanDecision(
@@ -483,18 +520,27 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> Pipeline
     return {"last_result": result, "done": done, "scratch": scratch}
 
 async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__"]]:
-    # save data + route. decide whether to loop back to plan or finish. on finish
-    # we drop the outcome into chat memory and reset the per-task counters so the
-    # next turn starts clean (state carries across turns via the checkpointer).
-    # eventually this is also where durable long-term memory gets saved to a Store
     result = state.get("last_result")
     step = state.get("step", 0)
+    query = state.get("query", "")
     finished = state.get("done", False) or step >= MAX_STEPS
+
+    # price task: first successful extract → finish immediately (don't plan again)
+    if not finished and is_price_task(query):
+        content = getattr(result, "extracted_content", None) or ""
+        if price_from_text(content):
+            answer = compact_glasses_reply(query, str(content))
+            print(f"  done (early): {answer}")
+            return Command(goto=END, update={
+                "messages": [{"role": "assistant", "content": answer}],
+                "step": 0, "done": False, "scratch": [],
+            })
 
     if finished:
         reason = "task done" if state.get("done") else f"hit MAX_STEPS ({MAX_STEPS})"
         answer = getattr(result, "extracted_content", None) or reason
-        print(f"  done: {str(answer)[:120]}{'…' if len(str(answer)) > 120 else ''}")
+        answer = compact_glasses_reply(query, str(answer))
+        print(f"  done: {answer}")
         return Command(goto=END, update={
             "messages": [{"role": "assistant", "content": str(answer)}],
             "step": 0,

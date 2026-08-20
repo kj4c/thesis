@@ -39,7 +39,8 @@ def last_assistant_reply(workflow, config: RunnableConfig) -> str:
 
 async def run_turn_with_result(workflow, query: str, config: RunnableConfig) -> str:
     await run_turn(workflow, query, config)
-    return last_assistant_reply(workflow, config)
+    from reply_format import compact_glasses_reply
+    return compact_glasses_reply(query, last_assistant_reply(workflow, config))
 
 
 async def run_once(query: str, thread_id: str = "1"):

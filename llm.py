@@ -8,14 +8,19 @@ from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 
 load_dotenv()
 
+# accept "claude" as an alias for "anthropic" in .env
+def _provider(name: str) -> str:
+    p = (name or "groq").lower()
+    return "anthropic" if p == "claude" else p
+
 # ── planner model ─────────────────────────────────────────────────────────────
 # pick the provider/model with .env (PLANNER_PROVIDER, and OLLAMA/GROQ/CLAUDE_MODEL)
-PLANNER_PROVIDER = os.getenv("PLANNER_PROVIDER", "groq").lower()
+PLANNER_PROVIDER = _provider(os.getenv("PLANNER_PROVIDER", "groq"))
 
 PLANNER_MODELS = {
     "ollama": os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
     "groq": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
-    "anthropic": os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+    "anthropic": os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
     "gemini": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
 }
 
@@ -49,10 +54,10 @@ def make_planner_llm():
 # ── vision model  ──────────
 # set USE_VISION=false to turn the consensus off and fall back to DOM-only verification
 USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
-VISION_PROVIDER = os.getenv("VISION_PROVIDER", "gemini").lower()
+VISION_PROVIDER = _provider(os.getenv("VISION_PROVIDER", "anthropic"))
 _VISION_DEFAULTS = {
     "gemini": "gemini-3.5-flash",
-    "anthropic": "claude-haiku-4-5-20251001",
+    "anthropic": "claude-sonnet-4-5-20250929",
     "ollama": "qwen2.5vl:7b",
     "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
 }
@@ -67,10 +72,10 @@ def make_vision_llm():
 
 
 # ── glasses POV input (independent of USE_VISION analyse gate) ───────────────
-GLASSES_VISION_PROVIDER = os.getenv("GLASSES_VISION_PROVIDER", "gemini").lower()
+GLASSES_VISION_PROVIDER = _provider(os.getenv("GLASSES_VISION_PROVIDER", "anthropic"))
 GLASSES_VISION_MODEL = os.getenv(
     "GLASSES_VISION_MODEL",
-    _VISION_DEFAULTS.get(GLASSES_VISION_PROVIDER, "gemini-2.0-flash"),
+    _VISION_DEFAULTS.get(GLASSES_VISION_PROVIDER, "claude-sonnet-4-5-20250929"),
 )
 
 
@@ -83,7 +88,7 @@ def make_glasses_vision_llm():
 # extract sends the WHOLE page to the model, so it needs a big context + generous
 # rate limit. the planner model can be too small. defaults to the vision model
 # (gemini), independently overridable via EXTRACTION_PROVIDER / EXTRACTION_MODEL.
-EXTRACTION_PROVIDER = os.getenv("EXTRACTION_PROVIDER", VISION_PROVIDER).lower()
+EXTRACTION_PROVIDER = _provider(os.getenv("EXTRACTION_PROVIDER", VISION_PROVIDER))
 EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", VISION_MODEL)
 
 
