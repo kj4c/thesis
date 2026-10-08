@@ -1,6 +1,10 @@
 # local http server that receives data from the meta glasses companion app
 #
 # POST /data  { prompt, media_type, media_data (base64), filename }
+#   the request stays open until the gui has dealt with it, because the phone
+#   reads the agent's answer aloud. same reply shape as serve.py:
+#     {"status": "success", "id": <uuid>, "result": str}
+#     {"status": "error",   "id": <uuid>, "error": str}
 # GET  /health  returns {"status": "ok"} so the phone app can check connectivity
 
 import asyncio
@@ -112,7 +116,9 @@ class GlassesServer:
         self._loop.run_until_complete(self._serve())
 
     async def _serve(self):
-        app = web.Application()
+        # photos arrive base64-encoded in the json body; aiohttp's default 1mb
+        # cap would turn a larger one into an "invalid json" error
+        app = web.Application(client_max_size=20 * 1024 ** 2)
         app.router.add_get('/health', self._handle_health)
         app.router.add_post('/data', self._handle_data)
 
@@ -147,14 +153,15 @@ class GlassesServer:
 
         media_type = payload.get('media_type', 'unknown')
         media_data_b64 = payload.get('media_data', '')
-        filename = payload.get('filename') or f'{uuid.uuid4()}.bin'
 
-        # decode and save media to disk
+        # decode and save media to disk. the phone names every photo pic.jpg, so
+        # only the extension is kept and each upload gets its own file
         media_path = ''
         if media_data_b64:
+            ext = os.path.splitext(payload.get('filename') or '')[1] or '.bin'
             try:
                 media_bytes = base64.b64decode(media_data_b64)
-                media_path = str(MEDIA_DIR / filename)
+                media_path = str(MEDIA_DIR / f'{uuid.uuid4()}{ext}')
                 with open(media_path, 'wb') as f:
                     f.write(media_bytes)
             except Exception as exc:
@@ -163,6 +170,26 @@ class GlassesServer:
                 )
 
         item = self.store.add(prompt, media_type, media_path)
-        self._on_data(item)
 
-        return web.json_response({'status': 'received', 'id': item['id']})
+        loop = asyncio.get_running_loop()
+        outcome: asyncio.Future = loop.create_future()
+
+        def reply(result: str = '', error: str = ''):
+            # called by the gui, from any thread, once it has an answer for the
+            # phone. only the first call counts.
+            def _set():
+                if not outcome.done():
+                    outcome.set_result((result, error))
+            try:
+                loop.call_soon_threadsafe(_set)
+            except RuntimeError:
+                pass  # the listener was stopped while the agent was working
+
+        self._on_data(item, reply)
+        result, error = await outcome
+
+        if error:
+            return web.json_response(
+                {'status': 'error', 'id': item['id'], 'error': error}, status=500
+            )
+        return web.json_response({'status': 'success', 'id': item['id'], 'result': result})

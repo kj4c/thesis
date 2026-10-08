@@ -3,12 +3,20 @@ import concurrent.futures
 import json
 import os
 import threading
-from urllib.parse import urlparse
+import uuid
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import wx
 
-from browser_use import Agent, BrowserSession, ChatGoogle
+from browser_use import BrowserSession
 from dotenv import load_dotenv
+from glasses_vision import enrich_prompt_with_image
+from graph import build_agent
+from mvp import last_assistant_reply
+from nodes import _decision_to_action
+from reply_format import compact_glasses_reply
+from state import _resources, _run_config, _start_resources
 from .glasses_server import GlassesServer
 from .voice import VoiceRecorder, transcribe as transcribe_voice
 
@@ -52,7 +60,37 @@ def _describe_page(title: str, url: str) -> str:
     return _domain(url) or 'a new blank tab'
 
 
+async def _element_label(session: BrowserSession, index: int | None) -> str:
+    # the visible name of a page element, so a click reads as
+    # 'Clicking "Add to cart"' instead of 'Clicking element #12'
+    if index is None:
+        return ''
+    try:
+        node = await session.get_element_by_index(index)
+        text = node.get_meaningful_text_for_llm() if node else ''
+    except Exception:
+        return ''
+    return ' '.join(text.split())[:60]
+
+
+def _describe_navigate(p: dict) -> str:
+    url = p.get('url', '')
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query).get('q')
+    if 'google.' in parsed.netloc and parsed.path == '/search' and query:
+        return f'Searching Google for "{query[0]}"'
+    return f'Opening {url or "a page"}' + (' in a new tab' if p.get('new_tab') else '')
+
+
+def _describe_input(p: dict) -> str:
+    if not p.get('text'):
+        return 'Clearing a text field'
+    return f'Typing "{p["text"]}"' + (f' into "{p["label"]}"' if p.get('label') else '')
+
+
 def _describe_click(p: dict) -> str:
+    if p.get('label'):
+        return f'Clicking "{p["label"]}"'
     if p.get('index') is not None:
         return f'Clicking element #{p["index"]} on the page'
     if p.get('coordinate_x') is not None:
@@ -64,13 +102,11 @@ def _describe_click(p: dict) -> str:
 # field name (see browser_use/tools/service.py action registrations)
 ACTION_DESCRIPTIONS = {
     'search': lambda p: f'Searching {p.get("engine", "the web")} for "{p.get("query", "")}"',
-    'navigate': lambda p: (
-        f'Opening {p.get("url", "a page")}' + (' in a new tab' if p.get('new_tab') else '')
-    ),
+    'navigate': _describe_navigate,
     'go_back': lambda p: 'Going back to the previous page',
     'wait': lambda p: f'Waiting {p.get("seconds", "a few")} seconds',
     'click': _describe_click,
-    'input': lambda p: f'Typing "{p["text"]}"' if p.get('text') else 'Clearing a text field',
+    'input': _describe_input,
     'scroll': lambda p: 'Scrolling down the page' if p.get('down', True) else 'Scrolling up the page',
     'send_keys': lambda p: f'Pressing {p.get("keys", "")}',
     'switch': lambda p: 'Switching to another browser tab',
@@ -88,11 +124,11 @@ ACTION_DESCRIPTIONS = {
     'read_file': lambda p: f'Reading {p.get("file_name", "a file")}',
     'replace_file': lambda p: f'Updating {p.get("file_name", "a file")}',
     'evaluate': lambda p: 'Running a script on the page',
-    'done': lambda p: p.get('text') or 'Finishing up',
+    'done': lambda p: 'Finishing up',
 }
 
 
-def _describe_action(action) -> str:
+def _describe_action(action, label: str = '') -> str:
     try:
         data = action.model_dump(exclude_unset=True)
     except Exception:
@@ -100,7 +136,7 @@ def _describe_action(action) -> str:
     if not data:
         return ''
     name, params = next(iter(data.items()))
-    params = params or {}
+    params = {**(params or {}), 'label': label}
     formatter = ACTION_DESCRIPTIONS.get(name)
     if formatter:
         try:
@@ -229,8 +265,13 @@ class MainFrame(wx.Frame):
         self._permission_ = threading.Event()
         self._permission_approved = False
         self._prev_domain: str = ''
-        self._agent: Agent | None = None
+        # the langgraph agent (graph.py) plus the config carrying its live
+        # browser and thread_id; both are created on the first run
+        self._workflow = None
+        self._config = None
         self._browser_session: BrowserSession | None = None
+        self._logged_decision = None
+        self._full_answer = ''
 
         # one persistent asyncio loop for the app's lifetime, so a kept-alive
         # BrowserSession's async resources (event bus, CDP connection) survive
@@ -241,7 +282,7 @@ class MainFrame(wx.Frame):
 
         port = self.settings.get('glasses_port', 8765)
         self._glasses_server = GlassesServer(
-            port, lambda item: wx.CallAfter(self._on_glasses_data, item)
+            port, lambda item, reply: wx.CallAfter(self._on_glasses_data, item, reply)
         )
         self._voice_recorder = VoiceRecorder()
 
@@ -347,8 +388,11 @@ class MainFrame(wx.Frame):
 
     # agent execution
 
+    def _agent_busy(self) -> bool:
+        return self._agent_future is not None and not self._agent_future.done()
+
     def _on_run(self, _):
-        if self._agent_future is not None and not self._agent_future.done():
+        if self._agent_busy():
             self._log('[!] Agent is already running.')
             return
 
@@ -358,64 +402,130 @@ class MainFrame(wx.Frame):
                           wx.OK | wx.ICON_WARNING, self)
             return
 
-        if self._agent is not None:
+        self.prompt.Clear()
+        self._start_run(task)
+
+    def _start_run(self, task: str, glasses_item: dict | None = None, reply=None):
+        # glasses_item and reply are set when the task came from the phone app;
+        # reply(result=..., error=...) answers the request the phone is waiting on
+        if self._workflow is not None:
             self._log(f'\nFollow-up: {task}')
         else:
             self.log.Clear()
             self._prev_domain = ''
             self._log(f'Task: {task}')
 
-        self.prompt.Clear()
         self._set_status('Running…')
         self.run_btn.Disable()
         self.new_task_btn.Disable()
 
         self._agent_future = asyncio.run_coroutine_threadsafe(
-            self._run_agent_async(task), self._loop
+            self._run_agent_async(task, glasses_item, reply), self._loop
         )
 
-    async def _run_agent_async(self, task: str):
+    async def _run_agent_async(self, task: str, glasses_item: dict | None, reply):
+        result, error = '', ''
         try:
-            if self._agent is None:
-                llm = ChatGoogle(model='gemini-flash-latest')
-                # keep_alive keeps the browser open after run() so a follow-up
-                # question can continue on the same page instead of starting over
-                self._browser_session = BrowserSession(keep_alive=True)
-                self._agent = Agent(
-                    task=task,
-                    llm=llm,
-                    browser_session=self._browser_session,
-                    register_new_step_callback=self._on_agent_step,
-                )
-            else:
-                self._agent.add_new_task(task)
+            if self._workflow is None:
+                # the browser is kept alive between runs so a follow-up can
+                # continue on the same page, and one thread_id per session is
+                # what lets the agent remember the conversation so far
+                session, tools, file_system = await _start_resources()
+                self._browser_session = session
+                self._config = _run_config(session, tools, file_system, f'gui-{uuid.uuid4()}')
+                self._workflow = build_agent()
 
-            await self._agent.run()
-            self._log('\n[Done] Agent completed.')
-            self._set_status('Done')
-        except RuntimeError as e:
-            if 'denied' in str(e).lower():
+            query = await self._add_photo_context(task, glasses_item)
+            answer = await self._run_turn(query)
+            if answer is None:
+                error = 'A step was denied on the computer, so the agent stopped.'
                 self._log('[Stopped] Permission denied by user.')
                 self._set_status('Stopped')
             else:
-                self._log(f'[Error] {e}')
-                self._set_status('Error')
+                # the phone reads the reply aloud, so it gets the short form
+                result = compact_glasses_reply(query, answer)
+                self._log(f'\n[Done] {answer}')
+                full = self._full_answer.strip()
+                if len(full) > len(answer):
+                    self._log(f'Full answer: {full}')
+                self._set_status('Done')
         except Exception as e:
+            error = str(e)
             self._log(f'[Error] {e}')
             self._set_status('Error')
+            await self._end_task(f'Stopped by an error: {e}')
         finally:
+            if reply is not None:
+                reply(result=result, error=error)
             wx.CallAfter(self.run_btn.Enable)
             wx.CallAfter(self.new_task_btn.Enable)
             wx.CallAfter(self._announce_run_finished)
 
+    async def _add_photo_context(self, task: str, glasses_item: dict | None) -> str:
+        # a photo from the glasses is described by a vision model and folded into
+        # the prompt, so "this product" means the thing the user is looking at
+        media_path = (glasses_item or {}).get('media_path')
+        if not media_path:
+            return task
+        self._log('[Glasses] Looking at the photo…')
+        try:
+            enriched = await enrich_prompt_with_image(Path(media_path), task)
+        except Exception as e:
+            self._log(f'[Glasses] Could not read the photo ({e}); using the prompt only.')
+            return task
+        if enriched != task:
+            self._log(f'[Glasses] {enriched}')
+        return enriched
+
+    async def _run_turn(self, query: str) -> str | None:
+        # run one user turn through the graph, pausing before every `execute` so
+        # the step can be approved first. returns the agent's reply, or None if
+        # the user denied a step.
+        workflow, config = self._workflow, self._config
+        self._logged_decision = None
+        self._full_answer = ''
+        payload = {'query': query, 'messages': [{'role': 'user', 'content': query}]}
+        while True:
+            async for chunk in workflow.astream(
+                payload, config, stream_mode='updates', interrupt_before=['execute']
+            ):
+                for node, update in chunk.items():
+                    await self._log_update(node, update or {})
+
+            snapshot = await workflow.aget_state(config)
+            if not snapshot.next:
+                return last_assistant_reply(workflow, config)
+            if not await self._approve_step(snapshot.values):
+                await self._end_task('Stopped: the user denied this step.')
+                return None
+            payload = None  # resume from the pause
+
+    async def _end_task(self, note: str):
+        # close out a task that stopped part-way the same way node_resolve does,
+        # so the next prompt starts clean but the chat memory is kept
+        if self._workflow is None:
+            return
+        try:
+            await self._workflow.aupdate_state(
+                self._config,
+                {
+                    'messages': [{'role': 'assistant', 'content': note}],
+                    'step': 0, 'done': False, 'scratch': [],
+                },
+                as_node='resolve',
+            )
+        except Exception as e:
+            self._log(f'[!] Could not reset the agent: {e}')
+
     def _on_new_task(self, _):
-        if self._agent_future is not None and not self._agent_future.done():
+        if self._agent_busy():
             wx.MessageBox('Please wait for the current run to finish.', 'Agent Running',
                           wx.OK | wx.ICON_WARNING, self)
             return
 
         session = self._browser_session
-        self._agent = None
+        self._workflow = None
+        self._config = None
         self._browser_session = None
         self._prev_domain = ''
         self.log.Clear()
@@ -427,51 +537,95 @@ class MainFrame(wx.Frame):
         else:
             self._log('[New Task] Ready.')
 
-    async def _on_agent_step(self, state, output, step_num: int):
-        goal = getattr(output, 'next_goal', '') or ''
-        actions = getattr(output, 'action', None) or []
-        url = getattr(state, 'url', '') or ''
-        title = getattr(state, 'title', '') or ''
-
-        self._log(f'\nStep {step_num}')
-        self._log(f'  On page: {_describe_page(title, url)}')
-        if goal:
-            self._log(f'  Plan:    {goal}')
-        for action in actions:
-            description = _describe_action(action)
+    async def _log_update(self, node: str, update: dict):
+        # one graph node just finished; `update` is what it wrote to the state
+        if node == 'plan':
+            decision = update['last_decision']
+            url, title = await self._current_page()
+            description = await self._describe_decision(decision)
+            self._log(f'\nStep {update.get("step", "?")}')
+            self._log(f'  On page: {_describe_page(title, url)}')
+            if decision.reasoning:
+                self._log(f'  Plan:    {decision.reasoning}')
             if description:
                 self._log(f'  Doing:   {description}')
+            self._logged_decision = decision
+        elif node == 'analyse' and update.get('scratch'):
+            # the agent's own check turned the step down, so it plans again
+            reason = str(update['scratch'][-1].get('outcome', ''))
+            self._log(f'  Check:   Not doing that. {reason.removeprefix("gate rejected: ")}')
+        elif node == 'execute':
+            result = update.get('last_result')
+            if getattr(result, 'error', None):
+                self._log(f'  Problem: {result.error}')
+            if update.get('done'):
+                self._full_answer = str(getattr(result, 'extracted_content', '') or '')
 
-        if self._should_ask_permission(url, output):
-            description = self._format_permission_description(goal, actions, url, title)
+    async def _current_page(self) -> tuple[str, str]:
+        try:
+            session = self._browser_session
+            return await session.get_current_page_url(), await session.get_current_page_title()
+        except Exception:
+            return '', ''
+
+    async def _describe_decision(self, decision) -> str:
+        session, tools, _ = _resources(self._config)
+        action = _decision_to_action(tools, decision)
+        return _describe_action(action, await _element_label(session, decision.index))
+
+    async def _approve_step(self, values: dict) -> bool:
+        # the graph is paused just before `execute`; ask the user if the
+        # settings call for it. returns False if they deny the step.
+        decision = values['last_decision']
+        description = await self._describe_decision(decision)
+        if decision != self._logged_decision:
+            # the agent's check swapped in a different action (e.g. a forced stop)
+            self._log(f'  Doing:   {description}')
+            self._logged_decision = decision
+
+        url, title = await self._current_page()
+        going_to = decision.url if decision.action == 'navigate' and decision.url else url
+        if self._should_ask_permission(decision, going_to, values):
+            text = self._format_permission_description(
+                decision.reasoning, description, url, title
+            )
             await asyncio.get_running_loop().run_in_executor(
-                None, self._block_for_permission, description
+                None, self._block_for_permission, text
             )
             if not self._permission_approved:
-                raise RuntimeError('User denied permission.')
+                return False
 
-        self._prev_domain = _domain(url)
+        self._prev_domain = _domain(going_to)
+        return True
 
-    def _should_ask_permission(self, url: str, output) -> bool:
+    def _should_ask_permission(self, decision, url: str, values: dict) -> bool:
+        if decision.action == 'done':
+            return False  # only reports the answer; nothing happens in the browser
         freq = self.settings.get('permission_frequency', 'every_step')
         if freq == 'every_step':
             return True
         if freq == 'new_site':
             return _domain(url) != self._prev_domain
         if freq == 'on_error':
-            evaluation = getattr(output, 'evaluation_previous_goal', '') or ''
-            return any(w in evaluation.lower() for w in ('fail', 'error', 'could not', 'unable'))
+            # the previous step this task was turned down by the agent's own
+            # check, or ran and came back with an error
+            scratch = values.get('scratch') or []
+            if not scratch:
+                return False
+            outcome = str(scratch[-1].get('outcome', ''))
+            error = getattr(values.get('last_result'), 'error', None)
+            return outcome.startswith('gate rejected') or bool(
+                error and outcome == str(error)[:200]
+            )
         return False
 
     @staticmethod
-    def _format_permission_description(goal: str, actions, url: str, title: str) -> str:
+    def _format_permission_description(goal: str, description: str, url: str, title: str) -> str:
         lines = []
         if goal:
             lines.append(f'Plan: {goal}')
-        descriptions = [_describe_action(a) for a in (actions or [])]
-        for description in descriptions:
-            if description:
-                lines.append(f'Action: {description}')
+        if description:
+            lines.append(f'Action: {description}')
         if url:
             lines.append(f'Page: {_describe_page(title, url)}')
         return '\n'.join(lines) if lines else 'Continue to next step?'
@@ -513,31 +667,44 @@ class MainFrame(wx.Frame):
         else:
             self._stop_glasses_server()
 
-    def _on_glasses_data(self, item: dict):
-        # called on the wx main thread when the http server receives glasses data
+    def _on_glasses_data(self, item: dict, reply):
+        # called on the wx main thread when the phone app posts a prompt. the
+        # phone waits on that request for the agent's answer (it reads it aloud),
+        # so every path below has to end in reply(...)
         self._log(f'\n[Glasses] Received {item["media_type"]}: {item["prompt"]}')
+        store = self._glasses_server.store
+        busy = 'The agent is busy with another task. Try again in a moment.'
+
+        if self._agent_busy():
+            self._log('[Glasses] Agent is already running — told the phone to try again.')
+            reply(error=busy)
+            return
 
         dlg = GlassesDataDialog(self, item)
         dlg.ShowModal()
         choice = dlg.choice
         dlg.Destroy()
 
-        store = self._glasses_server.store
-
         if choice == GlassesDataDialog.ACT:
+            if self._agent_busy():
+                # another request was acted on while this dialog was open
+                self._log('[Glasses] Agent is already running — told the phone to try again.')
+                reply(error=busy)
+                return
             store.update_status(item['id'], 'acted')
             self._log(f'[Glasses] Acting on: {item["prompt"]}')
-            self.prompt.SetValue(item['prompt'])
-            self._on_run(None)
+            self._start_run(item['prompt'], item, reply)
 
         elif choice == GlassesDataDialog.DISMISS:
             store.update_status(item['id'], 'dismissed')
             self._log('[Glasses] Dismissed — data kept for later.')
+            reply(result='Saved on the computer for later.')
 
         else:
             store.update_status(item['id'], 'cancelled')
             store.delete_media(item)
             self._log('[Glasses] Cancelled — data erased.')
+            reply(result='Cancelled on the computer.')
 
     # settings and voice
 
