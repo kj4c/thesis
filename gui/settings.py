@@ -2,6 +2,8 @@ import socket
 
 import wx
 
+from . import a11y
+
 PERMISSION_OPTIONS = [
     ('Every step', 'every_step'),
     ('When switching to a new site', 'new_site'),
@@ -70,6 +72,8 @@ class SettingsDialog(wx.Dialog):
             style = wx.RB_GROUP if i == 0 else 0
             rb = wx.RadioButton(panel, label=label, style=style)
             rb._value = value  # type: ignore[attr-defined]
+            # the heading above isn't tied to the buttons for a screen reader
+            a11y.label(rb, f'Input method: {label}')
             self._input_radios.append(rb)
             sizer.Add(rb, 0, wx.LEFT, 24)
 
@@ -77,6 +81,7 @@ class SettingsDialog(wx.Dialog):
 
         sizer.Add(wx.StaticText(panel, label='Keyboard shortcut to submit:'), 0, wx.LEFT | wx.TOP, 10)
         self._shortcut_ctrl = wx.TextCtrl(panel)
+        a11y.label(self._shortcut_ctrl, 'Keyboard shortcut to submit', 'For example Ctrl+Return')
         sizer.Add(self._shortcut_ctrl, 0, wx.EXPAND | wx.ALL, 10)
         hint = wx.StaticText(panel, label='e.g. Ctrl+Return')
         hint.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
@@ -98,6 +103,7 @@ class SettingsDialog(wx.Dialog):
             style = wx.RB_GROUP if i == 0 else 0
             rb = wx.RadioButton(panel, label=label, style=style)
             rb._value = value  # type: ignore[attr-defined]
+            a11y.label(rb, f'Ask for user permission: {label}')
             self._perm_radios.append(rb)
             sizer.Add(rb, 0, wx.LEFT, 24)
 
@@ -125,6 +131,7 @@ class SettingsDialog(wx.Dialog):
             panel, value=f'{lan_ip}:{port}',
             style=wx.TE_READONLY | wx.BORDER_NONE,
         )
+        a11y.label(self._lan_label, 'LAN address')
         grid.Add(self._lan_label, 1, wx.EXPAND)
 
         grid.Add(wx.StaticText(panel, label='mDNS address:'), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -132,6 +139,7 @@ class SettingsDialog(wx.Dialog):
             panel, value=f'{_get_mdns_hostname()}:{port}',
             style=wx.TE_READONLY | wx.BORDER_NONE,
         )
+        a11y.label(self._mdns_label, 'mDNS address')
         grid.Add(self._mdns_label, 1, wx.EXPAND)
 
         sizer.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
@@ -154,6 +162,7 @@ class SettingsDialog(wx.Dialog):
         )
         self._port_ctrl = wx.SpinCtrl(panel, min=1024, max=65535, value=str(port))
         self._port_ctrl.SetMinSize((80, -1))
+        a11y.label(self._port_ctrl, 'Listener port')
         port_row.Add(self._port_ctrl, 0, wx.RIGHT, 12)
 
         self._autostart_chk = wx.CheckBox(panel, label='Start listener on launch')
@@ -210,11 +219,13 @@ class SettingsDialog(wx.Dialog):
             self._glasses_server.stop()
             self._listener_status.SetLabel('Stopped')
             self._toggle_btn.SetLabel('Start Listener')
+            a11y.announce('Listener stopped.')
         else:
             new_port = self._port_ctrl.GetValue()
             self._glasses_server.restart(new_port)
             self._listener_status.SetLabel('Running')
             self._toggle_btn.SetLabel('Stop Listener')
+            a11y.announce(f'Listener running on port {new_port}.')
 
     def _on_save(self, _event):
         for rb in self._input_radios:

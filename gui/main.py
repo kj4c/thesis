@@ -17,6 +17,7 @@ from mvp import last_assistant_reply
 from nodes import _decision_to_action
 from reply_format import compact_glasses_reply
 from state import _resources, _run_config, _start_resources
+from . import a11y
 from .glasses_server import GlassesServer
 from .voice import VoiceRecorder, transcribe as transcribe_voice
 
@@ -167,7 +168,7 @@ class PermissionDialog(wx.Dialog):
             self, value=description,
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.BORDER_SIMPLE,
         )
-        desc_ctrl.SetName('Requested action details')
+        a11y.label(desc_ctrl, 'Requested action details')
         desc_ctrl.SetMinSize((460, 100))
         sizer.Add(desc_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
 
@@ -181,6 +182,9 @@ class PermissionDialog(wx.Dialog):
         sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 12)
 
         self.SetSizerAndFit(sizer)
+        # start on the details so a screen reader reads them when the dialog
+        # opens (queued, because focus set before the dialog is shown is lost)
+        wx.CallAfter(desc_ctrl.SetFocus)
         approve.Bind(wx.EVT_BUTTON, lambda _: self._close(True))
         deny.Bind(wx.EVT_BUTTON, lambda _: self._close(False))
 
@@ -218,7 +222,7 @@ class GlassesDataDialog(wx.Dialog):
             self, value=item.get('prompt', ''),
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.BORDER_SIMPLE,
         )
-        prompt_ctrl.SetName('Prompt received from glasses')
+        a11y.label(prompt_ctrl, 'Prompt received from glasses')
         prompt_ctrl.SetMinSize((440, 80))
         sizer.Add(prompt_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
 
@@ -245,6 +249,8 @@ class GlassesDataDialog(wx.Dialog):
 
         sizer.Add(btn_row, 0, wx.ALL | wx.ALIGN_CENTER, 12)
         self.SetSizerAndFit(sizer)
+        # start on the prompt so a screen reader reads it when the dialog opens
+        wx.CallAfter(prompt_ctrl.SetFocus)
 
         act_btn.Bind(wx.EVT_BUTTON, lambda _: self._close(self.ACT))
         dismiss_btn.Bind(wx.EVT_BUTTON, lambda _: self._close(self.DISMISS))
@@ -305,7 +311,8 @@ class MainFrame(wx.Frame):
         self.prompt = wx.TextCtrl(panel, style=wx.TE_MULTILINE)
         self.prompt.SetMinSize((-1, 80))
         self.prompt.SetHint('Describe the task for the agent…')
-        self.prompt.SetName('Task description')
+        a11y.label(self.prompt, 'Task description',
+                   'Press Return to run the agent. Shift Return adds a new line.')
         root.Add(self.prompt, 0, wx.EXPAND | wx.ALL, 10)
 
         # buttons
@@ -340,15 +347,15 @@ class MainFrame(wx.Frame):
             panel,
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_AUTO_URL | wx.BORDER_SIMPLE,
         )
-        self.log.SetName('Activity log')
+        a11y.label(self.log, 'Activity log')
         root.Add(self.log, 1, wx.EXPAND | wx.ALL, 10)
 
         panel.SetSizer(root)
 
         self.status_bar = self.CreateStatusBar(2)
         self.status_bar.SetStatusWidths([-1, 180])
-        self.status_bar.SetStatusText('Ready')
-        self.status_bar.SetStatusText('Glasses: off', 1)
+        self._show_status('Ready')
+        self._show_status('Glasses: off', 1)
 
         self.prompt.Bind(wx.EVT_KEY_DOWN, self._on_prompt_key_down)
         self.run_btn.Bind(wx.EVT_BUTTON, self._on_run)
@@ -374,17 +381,32 @@ class MainFrame(wx.Frame):
 
     # log helpers, safe to call from any thread
 
-    def _log(self, msg: str):
+    def _log(self, msg: str, speak: bool = False):
+        # speak=True also has the screen reader say the line, for the moments a
+        # user needs to hear without going to read the log
         wx.CallAfter(self.log.AppendText, msg + '\n')
+        if speak:
+            # '[Voice] Recording started.' is spoken as 'Voice: Recording started.'
+            spoken = msg.strip().replace('[!] ', '').replace('[', '', 1).replace(']', ':', 1)
+            wx.CallAfter(a11y.announce, spoken)
 
     def _set_status(self, text: str):
-        wx.CallAfter(self.status_bar.SetStatusText, text)
+        wx.CallAfter(self._show_status, text)
+
+    def _show_status(self, text: str, field: int = 0):
+        # the status bar is drawn by wx, so a screen reader can't see it unless
+        # its text is handed over separately
+        self.status_bar.SetStatusText(text, field)
+        a11y.expose_text(
+            self.status_bar,
+            f'Status: {self.status_bar.GetStatusText(0)}, {self.status_bar.GetStatusText(1)}',
+        )
 
     def _announce_run_finished(self):
-        # move focus to the end of the log so screen readers pick up the
-        # final [Done]/[Stopped]/[Error] line without narrating every step
+        # the outcome is spoken by _log(speak=True). focus stays where it is,
+        # because moving it would cut that speech off; the log's cursor is left
+        # at the end for when the user goes to read the detail.
         self.log.SetInsertionPointEnd()
-        self.log.SetFocus()
 
     # agent execution
 
@@ -393,7 +415,7 @@ class MainFrame(wx.Frame):
 
     def _on_run(self, _):
         if self._agent_busy():
-            self._log('[!] Agent is already running.')
+            self._log('[!] Agent is already running.', speak=True)
             return
 
         task = self.prompt.GetValue().strip()
@@ -415,6 +437,7 @@ class MainFrame(wx.Frame):
             self._prev_domain = ''
             self._log(f'Task: {task}')
 
+        wx.CallAfter(a11y.announce, 'Agent started.')
         self._set_status('Running…')
         self.run_btn.Disable()
         self.new_task_btn.Disable()
@@ -439,19 +462,19 @@ class MainFrame(wx.Frame):
             answer = await self._run_turn(query)
             if answer is None:
                 error = 'A step was denied on the computer, so the agent stopped.'
-                self._log('[Stopped] Permission denied by user.')
+                self._log('[Stopped] Permission denied by user.', speak=True)
                 self._set_status('Stopped')
             else:
                 # the phone reads the reply aloud, so it gets the short form
                 result = compact_glasses_reply(query, answer)
-                self._log(f'\n[Done] {answer}')
+                self._log(f'\n[Done] {answer}', speak=True)
                 full = self._full_answer.strip()
                 if len(full) > len(answer):
                     self._log(f'Full answer: {full}')
                 self._set_status('Done')
         except Exception as e:
             error = str(e)
-            self._log(f'[Error] {e}')
+            self._log(f'[Error] {e}', speak=True)
             self._set_status('Error')
             await self._end_task(f'Stopped by an error: {e}')
         finally:
@@ -533,9 +556,9 @@ class MainFrame(wx.Frame):
 
         if session is not None:
             asyncio.run_coroutine_threadsafe(session.kill(), self._loop)
-            self._log('[New Task] Previous browser session closed.')
+            self._log('[New Task] Previous browser session closed.', speak=True)
         else:
-            self._log('[New Task] Ready.')
+            self._log('[New Task] Ready.', speak=True)
 
     async def _log_update(self, node: str, update: dict):
         # one graph node just finished; `update` is what it wrote to the state
@@ -638,6 +661,7 @@ class MainFrame(wx.Frame):
 
     def _show_permission_dialog(self, description: str):
         dlg = PermissionDialog(self, description)
+        a11y.bring_to_front()
         dlg.ShowModal()
         self._permission_approved = dlg.approved
         dlg.Destroy()
@@ -649,15 +673,15 @@ class MainFrame(wx.Frame):
         started = self._glasses_server.start()
         if started:
             port = self._glasses_server.port
-            self._log(f'[Glasses] Listening on port {port}.')
-            self.status_bar.SetStatusText(f'Glasses: :{port}', 1)
+            self._log(f'[Glasses] Listening on port {port}.', speak=True)
+            self._show_status(f'Glasses: on, port {port}', 1)
             self.glasses_btn.SetLabel('Glasses: On')
             self.glasses_btn.SetValue(True)
 
     def _stop_glasses_server(self):
         self._glasses_server.stop()
-        self._log('[Glasses] Listener stopped.')
-        self.status_bar.SetStatusText('Glasses: off', 1)
+        self._log('[Glasses] Listener stopped.', speak=True)
+        self._show_status('Glasses: off', 1)
         self.glasses_btn.SetLabel('Glasses: Off')
         self.glasses_btn.SetValue(False)
 
@@ -676,11 +700,12 @@ class MainFrame(wx.Frame):
         busy = 'The agent is busy with another task. Try again in a moment.'
 
         if self._agent_busy():
-            self._log('[Glasses] Agent is already running — told the phone to try again.')
+            self._log('[Glasses] Agent is already running — told the phone to try again.', speak=True)
             reply(error=busy)
             return
 
         dlg = GlassesDataDialog(self, item)
+        a11y.bring_to_front()
         dlg.ShowModal()
         choice = dlg.choice
         dlg.Destroy()
@@ -688,7 +713,7 @@ class MainFrame(wx.Frame):
         if choice == GlassesDataDialog.ACT:
             if self._agent_busy():
                 # another request was acted on while this dialog was open
-                self._log('[Glasses] Agent is already running — told the phone to try again.')
+                self._log('[Glasses] Agent is already running — told the phone to try again.', speak=True)
                 reply(error=busy)
                 return
             store.update_status(item['id'], 'acted')
@@ -720,34 +745,34 @@ class MainFrame(wx.Frame):
         try:
             self._voice_recorder.start()
         except Exception as e:
-            self._log(f'[Voice] Failed to start recording: {e}')
+            self._log(f'[Voice] Failed to start recording: {e}', speak=True)
             self.voice_btn.SetValue(False)
             return
         self.voice_btn.SetLabel('Recording… (click to stop)')
         self._set_status('Recording voice input…')
-        self._log('[Voice] Recording started.')
+        self._log('[Voice] Recording started.', speak=True)
 
     def _stop_voice_recording(self):
         self.voice_btn.SetLabel('Voice Input')
         self.voice_btn.Disable()
         self._set_status('Transcribing…')
-        self._log('[Voice] Recording stopped, transcribing…')
+        self._log('[Voice] Recording stopped, transcribing…', speak=True)
         threading.Thread(target=self._transcribe_recording, daemon=True).start()
 
     def _transcribe_recording(self):
         try:
             audio_bytes = self._voice_recorder.stop()
             if not audio_bytes:
-                self._log('[Voice] No audio captured.')
+                self._log('[Voice] No audio captured.', speak=True)
                 return
             text = transcribe_voice(audio_bytes)
             if text:
                 wx.CallAfter(self._apply_transcript, text)
-                self._log(f'[Voice] Transcribed: {text}')
+                self._log(f'[Voice] Transcribed: {text}', speak=True)
             else:
-                self._log('[Voice] Could not transcribe audio (empty result).')
+                self._log('[Voice] Could not transcribe audio (empty result).', speak=True)
         except Exception as e:
-            self._log(f'[Voice] Transcription failed: {e}')
+            self._log(f'[Voice] Transcription failed: {e}', speak=True)
         finally:
             self._set_status('Ready')
             wx.CallAfter(self.voice_btn.Enable)

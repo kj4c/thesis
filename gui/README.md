@@ -100,6 +100,23 @@ this launches the main window (`gui/main.py:AgentApp`).
   glasses app at, lets you change the listening port, and toggle
   auto-start on launch.
 
+### screen readers
+the app is set up for VoiceOver on macos (`gui/a11y.py`):
+- every control has a spoken name, including the task box, the activity
+  log, and the fields and options in settings. the status bar is readable
+  as a line of text.
+- the moments that matter are spoken without moving focus: the agent
+  starting, its answer (or that it stopped or hit an error), voice
+  recording and transcription, the glasses listener turning on or off, and
+  a phone request being turned away because the agent is busy. individual
+  steps are not narrated; they are in the activity log.
+- a permission or glasses dialog brings the app to the front and starts on
+  its details, so it is read out even if the browser window was in front.
+
+this relies on `pyobjc-framework-Cocoa`, which `browser-use` already pulls
+in on macos. on other platforms the names are still set, but nothing is
+spoken.
+
 ### settings
 opened via the **settings** button; three tabs:
 - **input** — choose text or voice as the default input method, and set the
