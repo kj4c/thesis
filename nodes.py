@@ -5,7 +5,7 @@
 from typing import Literal, Any
 import re
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from langgraph.graph import END
 from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
@@ -152,6 +152,53 @@ class PlanDecision(BaseModel):
     index: int | None = Field(default=None, description="for click/input: the [index] of the element")
     text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: the answer — for prices use ONLY e.g. '$54.99'")
     down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
+    success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
+
+    # Claude's structured output fills not-applicable optional fields with JUNK
+    # placeholders ("", "<UNKNOWN>", "null", "N/A", …) instead of omitting them,
+    # which crashes int/bool parsing. Coerce BY TYPE (not by enumerating sentinels,
+    # which is whack-a-mole): anything that isn't a real int/bool becomes None.
+    @field_validator("index", mode="before")
+    @classmethod
+    def _clean_index(cls, v):
+        if isinstance(v, bool) or v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None  # "", "<UNKNOWN>", "null", etc.
+
+    @field_validator("down", mode="before")
+    @classmethod
+    def _clean_down(cls, v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("true", "1", "yes", "down"):
+            return True
+        if s in ("false", "0", "no", "up"):
+            return False
+        return None  # anything else -> unset
+
+    @field_validator("url", "text", mode="before")
+    @classmethod
+    def _clean_optional_str(cls, v):
+        if isinstance(v, str) and v.strip().lower() in (
+            "", "null", "none", "n/a", "na", "unknown", "<unknown>", "undefined",
+        ):
+            return None
+        return v
+
+    # success is a plain bool (not optional); junk/blank -> default True
+    @field_validator("success", mode="before")
+    @classmethod
+    def _clean_success(cls, v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("false", "0", "no"):
+            return False
+        return True
 
 
 PLANNER_SYSTEM = SystemMessage(content=(
@@ -232,6 +279,16 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "picked, or propose a different item — assume the planner's target is correct "
     "unless the action is clearly ungrounded (e.g. an [index] that isn't the right "
     "element).\n\n"
+    "NEVER reject based on WHICH SITE or DOMAIN the page is on. A regional mirror "
+    "(amazon.com vs amazon.com.au, google.com vs google.co.uk) is FINE — the task "
+    "can be completed on any equivalent site, so the specific domain is irrelevant. "
+    "Do not demand the agent return to some 'original' domain.\n\n"
+    "If an OVERLAY / MODAL / interstitial / cookie or region banner is blocking the "
+    "page, APPROVE any reasonable action that dismisses or closes it — clicking ×, "
+    "Close, Dismiss, Continue, Accept, or ANY of the modal's own buttons. Getting "
+    "past a blocker is always valid progress; do NOT quibble over which dismiss "
+    "button is best, and do NOT reject a dismiss action because of where it leaves "
+    "the user.\n\n"
     "Judge by action type:\n"
     "- INTERMEDIATE action (click/navigate/input/scroll — anything except done): "
     "APPROVE if it is a sensible next step toward the task, EVEN IF it does not by "
@@ -257,17 +314,27 @@ VERIFIER_SYSTEM = SystemMessage(content=(
 # especially overlays/popups covering the page and whether a click visually lands
 # on the intended element
 VISION_VERIFIER_SYSTEM = SystemMessage(content=(
-    "You are a VISION verifier for a browser agent. You are shown a SCREENSHOT of "
-    "the current page and a proposed action. Judge ONLY from what you can SEE:\n"
-    "- Does the action target the right VISIBLE element? (e.g. a click on the "
-    "'Add to Cart' button really lands on that button, not something else.)\n"
-    "- Is an OVERLAY covering the page — a cookie/consent/newsletter/region popup "
-    "or modal? If so and the action isn't dismissing it, REJECT and say to dismiss "
-    "the overlay first (clicks on elements underneath will fail).\n"
-    "- For done: does the screen actually look consistent with the task being "
-    "complete?\n"
-    "Approve only if the action looks right given what's visible. Keep `reason` to "
-    "one sentence describing what you see."
+    "You are a VISION verifier for a browser agent. You see a SCREENSHOT of the "
+    "current VIEWPORT and a proposed action. Crucial: the agent AUTOMATICALLY "
+    "SCROLLS the target element into view before clicking, so the target is OFTEN "
+    "NOT visible in this screenshot — it can be below the fold. That is normal and "
+    "expected.\n\n"
+    "Your job is to catch VISIBLE problems, NOT to confirm you can see the target. "
+    "REJECT only when you can actually SEE something wrong:\n"
+    "- An OVERLAY / modal is covering the page (cookie/consent/newsletter/region "
+    "popup) and the action isn't dismissing it — clicks underneath will silently "
+    "fail. Say to dismiss the overlay first.\n"
+    "- The element visible AT the target position clearly contradicts the action "
+    "(e.g. the action says click 'Add to Cart' but that exact spot is plainly an "
+    "unrelated banner or ad).\n\n"
+    "If the target simply isn't visible (below the fold / off-screen), that is NOT "
+    "a reason to reject — APPROVE and note you can't see it but nothing is blocking. "
+    "Do NOT reject because the task needs more steps, and do NOT second-guess the "
+    "FLOW — e.g. never reject an 'Add to Cart' click by arguing the product page "
+    "must be opened first. Element targeting is the DOM channel's job; you veto "
+    "only VISIBLE blockers.\n\n"
+    "For done: reject only if the visible screen CLEARLY contradicts completion. "
+    "Keep `reason` to one sentence describing what you see."
 ))
 
 
@@ -287,7 +354,7 @@ def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
     if d.action == "extract" and d.text:
         return AM(extract={"query": d.text})
     if d.action == "done":
-        return AM(done={"text": d.text or "done", "success": True})
+        return AM(done={"text": d.text or "done", "success": d.success})
     # malformed action (e.g. click with no index) -> stop gracefully
     stop = tools.registry.create_action_model(include_actions=["done"])
     return stop(done={"text": f"stopping: incomplete action {d.action!r}", "success": False})
@@ -410,24 +477,46 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
 
     rej_key = f"(rejected: {decision.action} idx={decision.index} url={decision.url})"
 
-    prior_rejections = [e for e in state.get("scratch", []) if e.get("action") == rej_key]
-    if prior_rejections:
-        # if we already have a price from extract, return it instead of erroring
-        for e in reversed(state.get("scratch", [])):
-            raw = str(e.get("outcome", ""))
-            if p := price_from_text(raw):
-                answer = compact_glasses_reply(query, raw)
-                print(f"  analyse → stop, using price {answer}")
-                stop = PlanDecision(reasoning="returning best price found", action="done", text=answer)
-                return Command(goto="execute", update={"last_decision": stop})
-        last_reason = prior_rejections[-1].get("outcome", "the action was rejected repeatedly")
-        print("  analyse → stop (same action rejected twice)")
-        stop = PlanDecision(
-            reasoning="stuck: the gate rejected the same action repeatedly",
-            action="done",
-            text=f"couldn't find a price — {last_reason[:80]}",
+    # rejection loop guard: if this exact action was already rejected AND nothing
+    # has actually executed since, the planner is ignoring the feedback and
+    # spinning (plan→analyse→plan…). the execute-stage loop guard can't catch this
+    # because a rejected action never reaches execute. stop cleanly instead of
+    # looping to MAX_STEPS.
+    #
+    # BUT: only trip if there was NO real progress since the last such rejection.
+    # scratch stores executed actions as a dict `action`, and gate rejections as
+    # the rej_key STRING — so an executed (dict) entry after the last matching
+    # rejection means the situation changed (e.g. a `done` rejected as premature,
+    # then a modal 'Add to cart' actually clicked). re-evaluate rather than
+    # force-stop, or a legit second `done` gets killed as a "repeat".
+    scratch = state.get("scratch", [])
+    last_rej_idx = None
+    for i, e in enumerate(scratch):
+        if e.get("action") == rej_key:
+            last_rej_idx = i
+    if last_rej_idx is not None:
+        progressed = any(
+            not isinstance(e.get("action"), str)  # executed action -> dict; rejection -> str
+            for e in scratch[last_rej_idx + 1:]
         )
-        return Command(goto="execute", update={"last_decision": stop})
+        if not progressed:
+            # if we already have a price from extract, return it instead of erroring
+            for e in reversed(scratch):
+                raw = str(e.get("outcome", ""))
+                if price_from_text(raw):
+                    answer = compact_glasses_reply(query, raw)
+                    print(f"  analyse → stop, using price {answer}")
+                    stop = PlanDecision(reasoning="returning best price found", action="done", text=answer)
+                    return Command(goto="execute", update={"last_decision": stop})
+            last_reason = scratch[last_rej_idx].get("outcome", "the action was rejected repeatedly")
+            print("  analyse → stop (same action rejected twice)")
+            stop = PlanDecision(
+                reasoning="stuck: the gate rejected the same action repeatedly",
+                action="done",
+                success=False,
+                text=f"couldn't complete this — {last_reason[:80]}",
+            )
+            return Command(goto="execute", update={"last_decision": stop})
 
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
@@ -497,6 +586,7 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> Pipeline
         action = _decision_to_action(tools, PlanDecision(
             reasoning="loop guard: same action repeated without progress",
             action="done",
+            success=False,
             text="stopped: the agent kept repeating the same action without making progress",
         ))
         action_dump = action.model_dump(exclude_unset=True)
