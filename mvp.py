@@ -61,9 +61,9 @@ async def run_chat(thread_id: str = "1"):
     config = _run_config(session, tools, file_system, thread_id)
     print(f"planner: {llm.PLANNER_PROVIDER} / {llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER, '?')}")
     if llm.USE_VISION:
-        print(f"vision : {llm.VISION_PROVIDER} / {llm.VISION_MODEL}  (analyse consensus gate ON)")
+        print(f"vision : {llm.VISION_PROVIDER} / {llm.VISION_MODEL}  (plans + verifies from screenshots)")
     else:
-        print("vision : off  (analyse is DOM-only)")
+        print("vision : off  (DOM-only)")
     try:
         while True:
             try:

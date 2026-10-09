@@ -11,11 +11,12 @@ from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
 
 from browser_use import Tools, ActionResult
+from browser_use.browser.python_highlights import create_highlighted_screenshot_async
 from browser_use.llm.messages import (
     SystemMessage, UserMessage, ContentPartTextParam, ContentPartImageParam, ImageURL,
 )
 
-from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry
+from llm import USE_VISION, make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry
 from state import PipelineState, MAX_STEPS, _resources
 from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
@@ -118,20 +119,32 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
     # just answer? tasks go to plan; answers we reply to and end the turn. this
     # is also the conversational mode (e.g. "what's on this page")
     session, _, _ = _resources(config)
-    summary = await session.get_browser_state_summary(include_screenshot=False)
+    vision_llm = make_vision_llm()
+    summary = await session.get_browser_state_summary(include_screenshot=vision_llm is not None)
     dom_text = summary.dom_state.llm_representation()[:4000]
 
     history = _format_history(state.get("messages", [])[:-1])
-    user_msg = UserMessage(content=(
+    text = (
         f"{history}"
         f"User: {state['query']}\n\n"
         f"Current page: {summary.title} ({summary.url})\n\n"
         f"Interactive elements:\n{dom_text}"
-    ))
+    )
 
-    llm = make_planner_llm()
-    response = await _ainvoke_with_retry(llm, [RESPOND_SYSTEM, user_msg], RespondDecision)
-    decision: RespondDecision = response.completion
+    decision: RespondDecision | None = None
+    if vision_llm and summary.screenshot:
+        try:
+            response = await _ainvoke_with_retry(
+                vision_llm, [RESPOND_SYSTEM, _with_image(text, summary.screenshot)], RespondDecision,
+            )
+            decision = response.completion
+        except Exception as e:
+            print(f"  (vision respond failed, using text: {type(e).__name__}: {str(e)[:80]})")
+    if decision is None:
+        response = await _ainvoke_with_retry(
+            make_planner_llm(), [RESPOND_SYSTEM, UserMessage(content=text)], RespondDecision,
+        )
+        decision = response.completion
 
     if decision.kind == "task":
         print(f"  respond → task")
@@ -263,22 +276,28 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "page, choose done and honestly state what's missing — do NOT claim success."
 ))
 
+# vision mode: same rules, but the screenshot (with numbered element boxes) is the
+# primary view of the page and the elements list is only a reference
+VISION_PLANNER_SYSTEM = SystemMessage(content=(
+    "You are looking at a SCREENSHOT of the browser viewport. Every interactive "
+    "element is outlined with a coloured box labelled with a number — that number "
+    "is the element's [index]. Decide primarily from what you SEE: the layout, "
+    "which popup is on top, which product / result / button is which. The text "
+    "elements list after the screenshot is a reference for reading labels and "
+    "confirming an [index]; it can include elements that are off-screen. If what "
+    "you need isn't visible, scroll.\n\n"
+) + PLANNER_SYSTEM.content)
+
 
 # what the analyse (verifier) node returns: an independent check on the action
-# the planner picked, before it runs. this is the seed of the consensus gate —
-# one channel (DOM) for now, a vision channel slots in later.
+# the planner picked, before it runs.
 class Verdict(BaseModel):
     approved: bool = Field(description="true only if the proposed action is correct AND grounded in the page")
     reason: str = Field(description="one sentence: why it's right, or what's wrong / what to do instead")
 
 
-VERIFIER_SYSTEM = SystemMessage(content=(
-    "You are an independent verifier for a browser automation agent. You did NOT "
-    "choose the action. Judge ONLY whether the PROPOSED action is a reasonable "
-    "step. Do NOT redesign the task, second-guess which item/target the planner "
-    "picked, or propose a different item — assume the planner's target is correct "
-    "unless the action is clearly ungrounded (e.g. an [index] that isn't the right "
-    "element).\n\n"
+# judging rules shared by the DOM and vision verifiers
+_VERIFY_RULES = (
     "NEVER reject based on WHICH SITE or DOMAIN the page is on. A regional mirror "
     "(amazon.com vs amazon.com.au, google.com vs google.co.uk) is FINE — the task "
     "can be completed on any equivalent site, so the specific domain is irrelevant. "
@@ -306,36 +325,41 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "detour.\n"
     "  REJECT done only if neither holds; then say what's still needed.\n\n"
     "When rejecting, give one concrete next step."
-))
+)
+
+# DOM-only fallback verifier (USE_VISION=false or the vision call failed)
+VERIFIER_SYSTEM = SystemMessage(content=(
+    "You are an independent verifier for a browser automation agent. You did NOT "
+    "choose the action. Judge ONLY whether the PROPOSED action is a reasonable "
+    "step. Do NOT redesign the task, second-guess which item/target the planner "
+    "picked, or propose a different item — assume the planner's target is correct "
+    "unless the action is clearly ungrounded (e.g. an [index] that isn't the right "
+    "element).\n\n"
+) + _VERIFY_RULES)
 
 
-# the VISION channel of the consensus gate: same Verdict schema, but it judges
-# from the SCREENSHOT, not the DOM text — so it catches things the DOM misses,
-# especially overlays/popups covering the page and whether a click visually lands
-# on the intended element
+# the primary verifier: judges from the SCREENSHOT with numbered element boxes,
+# using the DOM list only to read labels / find off-screen indices
 VISION_VERIFIER_SYSTEM = SystemMessage(content=(
-    "You are a VISION verifier for a browser agent. You see a SCREENSHOT of the "
-    "current VIEWPORT and a proposed action. Crucial: the agent AUTOMATICALLY "
-    "SCROLLS the target element into view before clicking, so the target is OFTEN "
-    "NOT visible in this screenshot — it can be below the fold. That is normal and "
-    "expected.\n\n"
-    "Your job is to catch VISIBLE problems, NOT to confirm you can see the target. "
-    "REJECT only when you can actually SEE something wrong:\n"
+    "You are an independent verifier for a browser automation agent. You did NOT "
+    "choose the action. You see a SCREENSHOT of the current viewport where every "
+    "interactive element is outlined with a numbered box — the number is its "
+    "[index] — plus the text elements list for reference. Judge whether the "
+    "PROPOSED action is a reasonable step, primarily from what you SEE.\n\n"
+    "REJECT on VISIBLE problems:\n"
     "- An OVERLAY / modal is covering the page (cookie/consent/newsletter/region "
     "popup) and the action isn't dismissing it — clicks underneath will silently "
     "fail. Say to dismiss the overlay first.\n"
-    "- The element visible AT the target position clearly contradicts the action "
-    "(e.g. the action says click 'Add to Cart' but that exact spot is plainly an "
-    "unrelated banner or ad).\n\n"
-    "If the target simply isn't visible (below the fold / off-screen), that is NOT "
-    "a reason to reject — APPROVE and note you can't see it but nothing is blocking. "
-    "Do NOT reject because the task needs more steps, and do NOT second-guess the "
-    "FLOW — e.g. never reject an 'Add to Cart' click by arguing the product page "
-    "must be opened first. Element targeting is the DOM channel's job; you veto "
-    "only VISIBLE blockers.\n\n"
-    "For done: reject only if the visible screen CLEARLY contradicts completion. "
-    "Keep `reason` to one sentence describing what you see."
-))
+    "- The box with the proposed [index] is plainly the wrong element (e.g. the "
+    "action says 'Add to Cart' but that box is an ad, or it's forks when the task "
+    "wants spoons).\n\n"
+    "The target may be OFF-SCREEN (no box with that number visible) — the agent "
+    "scrolls it into view before clicking. If the elements list shows that [index] "
+    "as a sensible target, APPROVE. Do NOT second-guess which item the planner "
+    "picked unless it's clearly wrong, and do NOT second-guess the FLOW — e.g. "
+    "never reject an 'Add to Cart' click by arguing the product page must be "
+    "opened first.\n\n"
+) + _VERIFY_RULES + " Keep `reason` to one sentence.")
 
 
 def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
@@ -386,15 +410,38 @@ def _format_scratch(scratch: list[dict], limit: int = 10) -> str:
     )
 
 
+def _with_image(text: str, image_b64: str) -> UserMessage:
+    return UserMessage(content=[
+        ContentPartTextParam(text=text),
+        ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{image_b64}")),
+    ])
+
+
+async def _marked_screenshot(session, summary) -> str | None:
+    # draw a numbered box on every interactive element so the vision model can
+    # point at an [index] (the label is the same number as in the DOM list)
+    if not summary.screenshot:
+        return None
+    try:
+        cdp = await session.get_or_create_cdp_session(focus=False)
+        return await create_highlighted_screenshot_async(
+            summary.screenshot, summary.dom_state.selector_map, cdp, filter_highlight_ids=False,
+        )
+    except Exception as e:
+        print(f"  (couldn't mark screenshot, sending it plain: {type(e).__name__}: {str(e)[:80]})")
+        return summary.screenshot
+
+
 async def node_plan(state: PipelineState, config: RunnableConfig) -> PipelineState:
-    # read the page, ask the model for the next action. perception (DOM +
-    # screenshot) comes from browser-use; the decision comes from our own llm
-    # call, which is the whole point of owning the loop. we also feed in the
+    # read the page, ask the model for the next action. with vision on, the vision
+    # model plans from a numbered-box screenshot (plus the DOM list as reference);
+    # otherwise the text planner works from the DOM alone. we also feed in the
     # prior conversation so follow-up prompts have context.
     session, _, _ = _resources(config)  # planner only reads the page; execute acts
     step = state.get("step", 0) + 1
 
-    summary = await session.get_browser_state_summary()
+    vision_llm = make_vision_llm()
+    summary = await session.get_browser_state_summary(include_screenshot=vision_llm is not None)
     dom_text = summary.dom_state.llm_representation()
     # cap the DOM text so a huge page doesn't blow up tokens/cost in the MVP
     dom_text = dom_text[:6000]
@@ -402,19 +449,33 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> PipelineSta
     history = _format_history(state.get("messages", [])[:-1])
     # actions taken THIS task — the within-task memory that stops oscillation
     progress = _format_scratch(state.get("scratch", []))
-    user_msg = UserMessage(content=(
+    text = (
         f"{history}"
         f"Current request: {state['query']}\n\n"
         f"{progress}"
         f"Current page: {summary.title} ({summary.url})\n\n"
         f"Interactive elements:\n{dom_text}"
-    ))
+    )
 
-    llm = make_planner_llm()
-    response = await _ainvoke_with_retry(llm, [PLANNER_SYSTEM, user_msg], PlanDecision)
-    decision: PlanDecision = response.completion
+    decision: PlanDecision | None = None
+    mode = "vision"
+    image = await _marked_screenshot(session, summary) if vision_llm else None
+    if image:
+        try:
+            response = await _ainvoke_with_retry(
+                vision_llm, [VISION_PLANNER_SYSTEM, _with_image(text, image)], PlanDecision,
+            )
+            decision = response.completion
+        except Exception as e:
+            print(f"  (vision planner failed, using DOM: {type(e).__name__}: {str(e)[:80]})")
+    if decision is None:
+        mode = "DOM"
+        response = await _ainvoke_with_retry(
+            make_planner_llm(), [PLANNER_SYSTEM, UserMessage(content=text)], PlanDecision,
+        )
+        decision = response.completion
 
-    print(f"  [{step}] plan → {decision.action}")
+    print(f"  [{step}] plan ({mode}) → {decision.action}")
     return {"last_decision": decision, "step": step}
 
 async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
@@ -433,26 +494,25 @@ async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
     return r.completion
 
 
-async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
-                         screenshot: str | None) -> Verdict | None:
-    # channel 2: judge the action from the SCREENSHOT (a vision model). returns
+async def _verify_vision(decision: "PlanDecision", query: str, progress: str, dom_text: str,
+                         title: str, url: str, screenshot: str | None) -> Verdict | None:
+    # the primary verifier: judge the action from the numbered-box SCREENSHOT. returns
     # None if vision is off / no screenshot / the call fails — caller then falls
     # back to DOM-only so the agent never breaks just because vision is unavailable
     llm = make_vision_llm()
     if llm is None or not screenshot:
         return None
     try:
-        parts = [
-            ContentPartTextParam(text=(
-                f"Task: {query}\n\n{progress}"
-                f"Proposed action: {decision.action} "
-                f"(index={decision.index}, url={decision.url}, text={decision.text})\n"
-                f"Planner's reasoning: {decision.reasoning}\n\n"
-                f"Judge from the screenshot below."
-            )),
-            ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{screenshot}")),
-        ]
-        r = await _ainvoke_with_retry(llm, [VISION_VERIFIER_SYSTEM, UserMessage(content=parts)], Verdict)
+        text = (
+            f"Task: {query}\n\n{progress}"
+            f"Proposed action: {decision.action} "
+            f"(index={decision.index}, url={decision.url}, text={decision.text})\n"
+            f"Planner's reasoning: {decision.reasoning}\n\n"
+            f"Current page: {title} ({url})\n\n"
+            f"Interactive elements (reference):\n{dom_text}\n\n"
+            f"Judge from the screenshot below."
+        )
+        r = await _ainvoke_with_retry(llm, [VISION_VERIFIER_SYSTEM, _with_image(text, screenshot)], Verdict)
         return r.completion
     except Exception as e:
         print(f"  (vision channel unavailable: {type(e).__name__}: {str(e)[:80]})")
@@ -460,9 +520,9 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
 
 
 async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan"]]:
-    # verify before consequential actions (click, done). DOM is the decision;
-    # vision notes overlay issues but does not block when DOM already approved —
-    # otherwise a visible popup rejects a valid done answer and the agent loops.
+    # verify before consequential actions (click, done). the vision verifier
+    # decides from the numbered-box screenshot; the DOM verifier only runs when
+    # vision is off or its call fails.
     decision: PlanDecision = state["last_decision"]
 
     if decision.action not in ("click", "done"):
@@ -523,31 +583,22 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     dom_text = summary.dom_state.llm_representation()[:6000]
     progress = _format_scratch(state.get("scratch", []))
 
-    dom_v = await _verify_dom(decision, query, dom_text, progress,
-                              summary.title, summary.url)
-    # skip vision for done and for price tasks (saves ~2s per step, fewer overlay loops)
-    skip_vision = decision.action == "done" or is_price_task(query)
-    vis_v = None if skip_vision else await _verify_vision(
-        decision, query, progress, summary.screenshot,
-    )
+    image = await _marked_screenshot(session, summary) if USE_VISION else None
+    verdict = await _verify_vision(decision, query, progress, dom_text,
+                                   summary.title, summary.url, image)
+    channel = "vision"
+    if verdict is None:
+        channel = "DOM"
+        verdict = await _verify_dom(decision, query, dom_text, progress,
+                                    summary.title, summary.url)
 
-    approved = dom_v.approved
-    tag = "✓" if approved else "✗"
-    note = dom_v.reason[:100]
-    if vis_v and not vis_v.approved and approved:
-        note += f" (vision: {vis_v.reason[:60]}…)"
-    elif vis_v and not vis_v.approved and not approved:
-        note = vis_v.reason[:100]
-    print(f"  analyse [{tag}] {decision.action}: {note}")
+    tag = "✓" if verdict.approved else "✗"
+    print(f"  analyse [{channel} {tag}] {decision.action}: {verdict.reason[:100]}")
 
-    reason = dom_v.reason
-    if vis_v:
-        reason = f"DOM: {dom_v.reason} | VISION: {vis_v.reason}"
-
-    if approved:
+    if verdict.approved:
         return Command(goto="execute")
 
-    entry = {"action": rej_key, "outcome": f"gate rejected: {reason}"}
+    entry = {"action": rej_key, "outcome": f"gate rejected: {verdict.reason}"}
     return Command(goto="plan", update={"scratch": state.get("scratch", []) + [entry]})
 
 async def node_execute(state: PipelineState, config: RunnableConfig) -> PipelineState:

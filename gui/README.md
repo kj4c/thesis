@@ -24,8 +24,10 @@ copy `.env.example` to `.env` and fill in your api keys:
 cp .env.example .env
 ```
 
-- the agent's models are chosen in `.env`, not in the gui: `PLANNER_PROVIDER`
-  picks the planner, `VISION_PROVIDER` the second-opinion check, and
+- the agent's models are chosen in `.env`, not in the gui: `VISION_PROVIDER`
+  picks the main browser model (it plans and checks each step from a
+  screenshot), `PLANNER_PROVIDER` the text model used as a fallback and when
+  `USE_VISION=false`, and
   `GLASSES_VISION_PROVIDER` the model that reads photos from the glasses
   (see `llm.py` for the defaults). fill in the key for each provider you use.
 - `GOOGLE_API_KEY` — also needed for voice transcription, whichever

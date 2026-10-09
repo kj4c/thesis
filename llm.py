@@ -47,12 +47,14 @@ def _build_llm(provider: str, model: str):
 
 
 def make_planner_llm():
-    # the planner / DOM-verifier model (text). one place to choose it
+    # the text model: front desk + DOM-only planning/verifying when vision is off
     return _build_llm(PLANNER_PROVIDER, PLANNER_MODELS.get(PLANNER_PROVIDER))
 
 
 # ── vision model  ──────────
-# set USE_VISION=false to turn the consensus off and fall back to DOM-only verification
+# the PRIMARY browser model: plans each step and verifies clicks/done from a
+# screenshot with numbered element boxes. set USE_VISION=false to fall back to
+# the DOM-only text pipeline (PLANNER_PROVIDER does everything)
 USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
 VISION_PROVIDER = _provider(os.getenv("VISION_PROVIDER", "anthropic"))
 _VISION_DEFAULTS = {
@@ -65,7 +67,7 @@ VISION_MODEL = os.getenv("VISION_MODEL", _VISION_DEFAULTS.get(VISION_PROVIDER, "
 
 
 def make_vision_llm():
-    # returns None when vision is disabled -> analyse uses DOM-only verification
+    # returns None when vision is disabled -> plan/analyse use the DOM-only text path
     if not USE_VISION:
         return None
     return _build_llm(VISION_PROVIDER, VISION_MODEL)
