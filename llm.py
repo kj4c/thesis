@@ -8,6 +8,11 @@ from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 
 load_dotenv()
 
+# accept "claude" as an alias for "anthropic" in .env
+def _provider(name: str) -> str:
+    p = (name or "groq").lower()
+    return "anthropic" if p == "claude" else p
+
 # ── planner model ─────────────────────────────────────────────────────────────
 # pick the provider/model with .env (PLANNER_PROVIDER, and OLLAMA/GROQ/CLAUDE_MODEL)
 # anthropic / claude-sonnet-5-5 is the baseline model: every evaluation run from
@@ -21,11 +26,8 @@ PLANNER_MODELS = {
     "gemini": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
 }
 
-def make_planner_llm():
-    # builds the planner llm for whatever PLANNER_PROVIDER is set to. the one
-    # place we choose the model, so the nodes just call this
-    provider = PLANNER_PROVIDER
-    model = PLANNER_MODELS.get(provider)
+def _build_llm(provider: str, model: str):
+    # turn a provider name + model into a browser-use chat object with the right key
     if provider == "ollama":
         # local ollama server (defaults to http://localhost:11434). no key, no limits
         return ChatOllama(model=model, host=os.getenv("OLLAMA_HOST"))
@@ -50,6 +52,54 @@ def make_planner_llm():
         f"Unknown PLANNER_PROVIDER {provider!r}; use ollama | groq | anthropic | gemini"
     )
 
+def make_planner_llm():
+    # the planner / DOM-verifier model (text). one place to choose it
+    return _build_llm(PLANNER_PROVIDER, PLANNER_MODELS.get(PLANNER_PROVIDER))
+
+
+# ── vision model  ──────────
+# set USE_VISION=false to turn the consensus off and fall back to DOM-only verification
+USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
+VISION_PROVIDER = _provider(os.getenv("VISION_PROVIDER", "anthropic"))
+_VISION_DEFAULTS = {
+    "gemini": "gemini-3.5-flash",
+    "anthropic": "claude-sonnet-4-5-20250929",
+    "ollama": "qwen2.5vl:7b",
+    "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
+}
+VISION_MODEL = os.getenv("VISION_MODEL", _VISION_DEFAULTS.get(VISION_PROVIDER, "gemini-3.5-flash"))
+
+
+def make_vision_llm():
+    # returns None when vision is disabled -> analyse uses DOM-only verification
+    if not USE_VISION:
+        return None
+    return _build_llm(VISION_PROVIDER, VISION_MODEL)
+
+
+# ── glasses POV input (independent of USE_VISION analyse gate) ───────────────
+GLASSES_VISION_PROVIDER = _provider(os.getenv("GLASSES_VISION_PROVIDER", "anthropic"))
+GLASSES_VISION_MODEL = os.getenv(
+    "GLASSES_VISION_MODEL",
+    _VISION_DEFAULTS.get(GLASSES_VISION_PROVIDER, "claude-sonnet-4-5-20250929"),
+)
+
+
+def make_glasses_vision_llm():
+    # always vision-capable — used to read the photo the glasses send in
+    return _build_llm(GLASSES_VISION_PROVIDER, GLASSES_VISION_MODEL)
+
+
+# ── extraction model (for the `extract` action) ──────────────────────────────
+# extract sends the WHOLE page to the model, so it needs a big context + generous
+# rate limit. the planner model can be too small. defaults to the vision model
+# (gemini), independently overridable via EXTRACTION_PROVIDER / EXTRACTION_MODEL.
+EXTRACTION_PROVIDER = _provider(os.getenv("EXTRACTION_PROVIDER", VISION_PROVIDER))
+EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", VISION_MODEL)
+
+
+def make_extraction_llm():
+    return _build_llm(EXTRACTION_PROVIDER, EXTRACTION_MODEL)
 
 # longest rate-limit wait _ainvoke_with_retry backs off for before giving up.
 # keep it under the node timeout in graph.py (30s)

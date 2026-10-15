@@ -20,6 +20,20 @@ async def run_turn(workflow, query: str, config: RunnableConfig):
     )
 
 
+def last_assistant_reply(workflow, config: RunnableConfig) -> str:
+    msgs = workflow.get_state(config).values.get("messages", [])
+    for m in reversed(msgs):
+        if m.get("role") == "assistant":
+            return str(m.get("content", ""))
+    return "Task completed but no response was generated."
+
+
+async def run_turn_with_result(workflow, query: str, config: RunnableConfig) -> str:
+    await run_turn(workflow, query, config)
+    from reply_format import compact_glasses_reply
+    return compact_glasses_reply(query, last_assistant_reply(workflow, config))
+
+
 async def run_once(query: str, thread_id: str = "1"):
     # single-shot: one prompt, then tear down. handy for non-interactive tests.
     session, tools, file_system = await _start_resources()
@@ -37,6 +51,10 @@ async def run_chat(thread_id: str = "1"):
     workflow = build_agent()
     config = _run_config(session, tools, file_system, thread_id)
     print(f"planner: {llm.PLANNER_PROVIDER} / {llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER, '?')}")
+    if llm.USE_VISION:
+        print(f"vision : {llm.VISION_PROVIDER} / {llm.VISION_MODEL}  (analyse consensus gate ON)")
+    else:
+        print("vision : off  (analyse is DOM-only)")
     try:
         while True:
             try:
