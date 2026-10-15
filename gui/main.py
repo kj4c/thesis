@@ -277,7 +277,6 @@ class MainFrame(wx.Frame):
         self._config = None
         self._browser_session: BrowserSession | None = None
         self._logged_decision = None
-        self._full_answer = ''
 
         # one persistent asyncio loop for the app's lifetime, so a kept-alive
         # BrowserSession's async resources (event bus, CDP connection) survive
@@ -465,12 +464,12 @@ class MainFrame(wx.Frame):
                 self._log('[Stopped] Permission denied by user.', speak=True)
                 self._set_status('Stopped')
             else:
-                # the phone reads the reply aloud, so it gets the short form
+                # the agent stores the full answer; the screen reader and the
+                # phone (which reads it aloud) get the short form
                 result = compact_glasses_reply(query, answer)
-                self._log(f'\n[Done] {answer}', speak=True)
-                full = self._full_answer.strip()
-                if len(full) > len(answer):
-                    self._log(f'Full answer: {full}')
+                self._log(f'\n[Done] {result}', speak=True)
+                if len(answer.strip()) > len(result):
+                    self._log(f'Full answer: {answer.strip()}')
                 self._set_status('Done')
         except Exception as e:
             error = str(e)
@@ -508,7 +507,6 @@ class MainFrame(wx.Frame):
         if workflow is None or config is None:
             raise RuntimeError('The agent has not been started.')
         self._logged_decision = None
-        self._full_answer = ''
         payload: PipelineState | None = {
             'query': query, 'messages': [{'role': 'user', 'content': query}],
         }
@@ -586,8 +584,6 @@ class MainFrame(wx.Frame):
             error = getattr(result, 'error', None)
             if error:
                 self._log(f'  Problem: {error}')
-            if update.get('done'):
-                self._full_answer = str(getattr(result, 'extracted_content', '') or '')
 
     async def _current_page(self) -> tuple[str, str]:
         session = self._browser_session

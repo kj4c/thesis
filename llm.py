@@ -68,6 +68,12 @@ def make_planner_llm():
 # ── vision model  ──────────
 # set USE_VISION=false to turn the consensus off and fall back to DOM-only verification
 USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
+
+# price-lookup tuning for the glasses demo: the price rules in the planner and
+# verifier prompts, plus the early exits once a $ price is found (nodes.py).
+# on by default for the demo; test runs set PRICE_TUNING=false so general tasks
+# get the original prompts and no price shortcuts
+PRICE_TUNING = os.getenv("PRICE_TUNING", "true").lower() in ("1", "true", "yes")
 VISION_PROVIDER = _provider(os.getenv("VISION_PROVIDER", "anthropic"))
 _VISION_DEFAULTS = {
     "gemini": "gemini-3.5-flash",

@@ -14,9 +14,14 @@ from browser_use.llm.messages import (
     SystemMessage, UserMessage, ContentPartTextParam, ContentPartImageParam, ImageURL,
 )
 
-from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry
+from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry, PRICE_TUNING
 from state import PipelineState, MAX_STEPS, _resources
 from reply_format import compact_glasses_reply, is_price_task, price_from_text
+
+
+def _price_shortcuts(query: str) -> bool:
+    # the price-only early exits; off when PRICE_TUNING=FALSE (see llm.py)
+    return PRICE_TUNING and is_price_task(query)
 
 # ── LangGraph workflow ───────────────────────────────────────────────────────
 
@@ -80,7 +85,8 @@ class PlanDecision(BaseModel):
     action: Literal["navigate", "click", "input", "scroll", "extract", "done"]
     url: str | None = Field(default=None, description="for navigate: the URL to open")
     index: int | None = Field(default=None, description="for click/input: the [index] of the element")
-    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: the answer — for prices use ONLY e.g. '$54.99'")
+    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: "
+                             + ("the answer — for prices use ONLY e.g. '$54.99'" if PRICE_TUNING else "the answer/result"))
     down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
     success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
 
@@ -131,6 +137,20 @@ class PlanDecision(BaseModel):
         return True
 
 
+# price rules for the glasses demo (PRICE_TUNING); without them the planner gets
+# the original done rule
+_PRICE_PLANNER_RULES = (
+    "- done: set `text` to the final answer. For PRICE tasks: ONLY `$54.99` or "
+    "`$54.99 (different brand)` if the listing isn't the same brand as the user's "
+    "photo. One line max — no extra commentary.\n\n"
+    "PRICE / FIND TASKS — be fast (3–4 steps max):\n"
+    "- On search results: ONE extract for the first listed price, then done. STOP.\n"
+    "- Do NOT click into product pages, re-extract, or scroll for price-only tasks.\n"
+    "- If the first result is a different brand, still done with `$price (different brand)` "
+    "— do NOT keep searching.\n"
+    "- If actions-taken already shows an extract with a $ price, choose done immediately.\n\n"
+) if PRICE_TUNING else "- done: set `text` to the final answer/result for the user.\n\n"
+
 PLANNER_SYSTEM = SystemMessage(content=(
     "You are the planner for a browser automation agent. Each turn you get the "
     "user's task and the current page's interactive elements, each tagged with a "
@@ -146,15 +166,7 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "- extract: read the CURRENT page for a fact — set `text` to what you want "
     "(e.g. 'cheapest spoon price and product name'). Use this instead of scrolling "
     "around to hunt for information.\n"
-    "- done: set `text` to the final answer. For PRICE tasks: ONLY `$54.99` or "
-    "`$54.99 (different brand)` if the listing isn't the same brand as the user's "
-    "photo. One line max — no extra commentary.\n\n"
-    "PRICE / FIND TASKS — be fast (3–4 steps max):\n"
-    "- On search results: ONE extract for the first listed price, then done. STOP.\n"
-    "- Do NOT click into product pages, re-extract, or scroll for price-only tasks.\n"
-    "- If the first result is a different brand, still done with `$price (different brand)` "
-    "— do NOT keep searching.\n"
-    "- If actions-taken already shows an extract with a $ price, choose done immediately.\n\n"
+    + _PRICE_PLANNER_RULES +
     "SEARCHING THE WEB — Google is the default. To find or look something up, "
     "navigate DIRECTLY to a Google search URL in one step: "
     "https://www.google.com/search?q=<your+query+with+plus+signs>. Don't go to "
@@ -202,6 +214,19 @@ class Verdict(BaseModel):
     reason: str = Field(description="one sentence: why it's right, or what's wrong / what to do instead")
 
 
+# how the verifier judges a FIND task's done: price rules for the glasses demo
+# (PRICE_TUNING), else the original rule
+_VERIFIER_FIND_RULE = (
+    "  • FIND / PRICE task: APPROVE done if it contains a $ price OR a prior extract "
+    "found one. Wrong brand is OK — the reply will note `(different brand)`. "
+    "Do NOT reject and send the agent searching again for brand match.\n"
+) if PRICE_TUNING else (
+    "  • FIND / ANSWER task (e.g. 'find the cheapest spoon', 'what's the price'): "
+    "APPROVE if the requested information is present on the current page or already "
+    "stated in the done text. No click or committing action is required — reading "
+    "the page IS the completion.\n"
+)
+
 VERIFIER_SYSTEM = SystemMessage(content=(
     "You are an independent verifier for a browser automation agent. You did NOT "
     "choose the action. Judge ONLY whether the PROPOSED action is a reasonable "
@@ -226,9 +251,7 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "REDUNDANT (it or an equivalent already appears in the actions-taken list). "
     "Never reject just because more steps remain.\n"
     "- `done`: decide by TASK TYPE.\n"
-    "  • FIND / PRICE task: APPROVE done if it contains a $ price OR a prior extract "
-    "found one. Wrong brand is OK — the reply will note `(different brand)`. "
-    "Do NOT reject and send the agent searching again for brand match.\n"
+    + _VERIFIER_FIND_RULE +
     "  • DO / ACTION task (e.g. 'add to cart', 'submit', 'log in'): APPROVE if the "
     "actions-taken list already contains the completing action run WITHOUT error "
     "(e.g. an 'Add to bag' click). Do NOT require a visible confirmation — those are "
@@ -288,6 +311,21 @@ def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
     # malformed action (e.g. click with no index) -> stop gracefully
     stop = tools.registry.create_action_model(include_actions=["done"])
     return stop.model_validate({"done": {"text": f"stopping: incomplete action {d.action!r}", "success": False}})
+
+
+# how much of an action's outcome the planner sees in the actions-taken list.
+# extract gets more: its outcome IS the information the task asked for, and a
+# cut-off answer makes the planner extract again or fill in from memory
+OUTCOME_LIMIT = 200
+EXTRACT_OUTCOME_LIMIT = 1000
+
+
+def _extract_answer(content: str) -> str:
+    # browser-use wraps extract output as <url>…</url><query>…</query><result>…
+    # </result> (or <structured_result>); keep just the result so the answer isn't
+    # pushed past the limit by the wrapper
+    m = re.search(r"<(structured_result|result)>\s*(.*?)\s*</\1>", content, re.S)
+    return m.group(2) if m else content
 
 
 def _format_history(messages: list[dict], limit: int = 6) -> str:
@@ -401,7 +439,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     query = state.get("query", "")
 
     # price found in done text — skip slow verifier LLM call
-    if decision.action == "done" and price_from_text(decision.text or ""):
+    if PRICE_TUNING and decision.action == "done" and price_from_text(decision.text or ""):
         print("  analyse [✓] done: price in answer")
         return Command(goto="execute")
 
@@ -431,7 +469,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
         )
         if not progressed:
             # if we already have a price from extract, return it instead of erroring
-            for e in reversed(scratch):
+            for e in reversed(scratch) if PRICE_TUNING else []:
                 raw = str(e.get("outcome", ""))
                 if price_from_text(raw):
                     answer = compact_glasses_reply(query, raw)
@@ -456,7 +494,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     dom_v = await _verify_dom(decision, query, dom_text, progress,
                               summary.title, summary.url)
     # skip vision for done and for price tasks (saves ~2s per step, fewer overlay loops)
-    skip_vision = decision.action == "done" or is_price_task(query)
+    skip_vision = decision.action == "done" or _price_shortcuts(query)
     vis_v = None if skip_vision else await _verify_vision(
         decision, query, progress, summary.screenshot,
     )
@@ -501,7 +539,7 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
 
     # price task: if extract already returned a price, stop re-extracting
     query = state.get("query", "")
-    if action_name == "extract" and is_price_task(query):
+    if action_name == "extract" and _price_shortcuts(query):
         for e in state.get("scratch", []):
             if "extract" not in str(e.get("action", "")):
                 continue
@@ -541,8 +579,13 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
     # jot this action down in the within-task log so the next plan step sees it
     # read the page fresh so the outcome reflects where the action landed us
     after = await session.get_browser_state_summary(include_screenshot=False)
-    outcome = result.error or result.extracted_content or f"now on {after.url}"
-    entry = {"action": action_dump, "outcome": str(outcome)[:200]}
+    if result.error:
+        outcome, limit = result.error, OUTCOME_LIMIT
+    elif action_name == "extract" and result.extracted_content:
+        outcome, limit = _extract_answer(result.extracted_content), EXTRACT_OUTCOME_LIMIT
+    else:
+        outcome, limit = result.extracted_content or f"now on {after.url}", OUTCOME_LIMIT
+    entry = {"action": action_dump, "outcome": str(outcome)[:limit]}
     scratch = state.get("scratch", []) + [entry]
     return {"last_result": result, "done": done, "scratch": scratch}
 
@@ -553,14 +596,14 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
     finished = state.get("done", False) or step >= MAX_STEPS
 
     # price task: first successful extract → finish immediately (don't plan again)
-    if not finished and is_price_task(query):
+    if not finished and _price_shortcuts(query):
         content = getattr(result, "extracted_content", None) or ""
         if price_from_text(content):
             answer = compact_glasses_reply(query, str(content))
             print(f"  done (early): {answer}")
             return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
                 "messages": [{"role": "assistant", "content": answer}],
-                "step": 0, "done": False, "scratch": [],
+                "step": 0, "done": False, "scratch": [], "status": "ok",
             })
 
     if finished:
@@ -572,7 +615,8 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
             # never the last action's result: that isn't an answer to the task
             answer = (f"Sorry, I couldn't finish this within {MAX_STEPS} steps, so I "
                       f"stopped. You could try asking in a simpler or more specific way.")
-        answer = compact_glasses_reply(query, str(answer))
+        # stored in full: the gui and serve.py shorten it themselves where it's
+        # spoken or sent to the phone, and evaluation scores the full answer
         print(f"  done: {answer}")
         return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
             "messages": [{"role": "assistant", "content": str(answer)}],
