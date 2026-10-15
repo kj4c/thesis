@@ -52,10 +52,10 @@ def _retry_on(exc: Exception) -> bool:
 
 async def default_error_handler(state: PipelineState, error: NodeError) -> Command:
     # runs once a node has failed for good (after its retries). execute failures
-    # go back to the planner once, as the game plan says: it re-reads the page,
-    # so it notices if the action went through anyway. everything else ends the
-    # task: tell the user why, and reset the per-task state like resolve does so
-    # the next prompt starts clean
+    # go back to the planner once: it re-reads the page, so it notices if the
+    # action went through anyway. everything else ends the task: tell the user
+    # why, and reset the per-task state like resolve does so the next prompt
+    # starts clean
     status = _failure_status(error)
     scratch = state.get("scratch", [])
     print("── error ────────────────────────────────")

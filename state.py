@@ -9,8 +9,9 @@ from langchain_core.runnables import RunnableConfig
 from browser_use import BrowserSession, Tools, ActionResult
 from browser_use.filesystem.file_system import FileSystem
 
-# safety cap so a confused planner can't loop forever
-MAX_STEPS = 12
+# safety cap so a confused planner can't loop forever. 15 matches WebVoyager's
+# own iteration limit (--max_iter 15 in its run.sh), so evaluation runs compare
+MAX_STEPS = 15
 
 
 class PipelineState(TypedDict, total=False):
@@ -56,15 +57,18 @@ def _resources(config: RunnableConfig | None) -> tuple[BrowserSession, Tools, Fi
     return cfg["session"], cfg["tools"], cfg["file_system"]
 
 
-async def _start_resources() -> tuple[BrowserSession, Tools, FileSystem]:
+async def _start_resources(**browser_options: Any) -> tuple[BrowserSession, Tools, FileSystem]:
     # spin up the per-run resources: a live browser (kept alive so follow-ups
     # reuse the page), the action executor, and a scratch filesystem 
     # BROWSER_PATH (optional, .env) pins the browser binary: browser_use misses
     # newer playwright chromium ("Google Chrome for Testing.app"), and a fixed
     # browser keeps evaluation runs comparable. unset = browser_use's own search
+    # browser_options go straight to BrowserSession (evaluation fixes the window
+    # size with them); the gui and mvp.py pass none and get browser_use's defaults
     browser_path = os.getenv("BROWSER_PATH")
-    session = BrowserSession(keep_alive=True, executable_path=browser_path) if browser_path \
-        else BrowserSession(keep_alive=True)
+    if browser_path:
+        browser_options["executable_path"] = browser_path
+    session = BrowserSession(keep_alive=True, **browser_options)
     await session.start()
     tools = Tools()
     file_system = FileSystem(tempfile.mkdtemp(prefix="mvp_fs_"))

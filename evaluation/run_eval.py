@@ -9,8 +9,11 @@
 #   steps.jsonl   one line per graph node: what it decided or did, how long it
 #                 took, and the tokens and cost of the model calls inside it
 #   tasks.jsonl   one line per task: answer, status, steps, time, tokens, cost
-#   summary.csv   the same per task, with an empty `success` column to score
-#                 (scoring method still to agree, suggestions.markdown Q2)
+#   summary.csv   the same per task, with a `success` column to score. a task
+#                 that didn't end with status ok is filled in as 0 already
+#   screenshots/  per task: the page the planner read at each step (stepNN.png)
+#                 and the page at the end (final.png). both of WebVoyager's
+#                 scoring methods judge from these
 #
 # run from the project root:
 #   python evaluation/run_eval.py --label baseline
@@ -40,9 +43,10 @@ from contextvars import ContextVar
 from datetime import datetime
 
 import llm
+import nodes
 from graph import build_agent
 from mvp import last_assistant_reply
-from state import MAX_STEPS, PipelineState, _run_config, _start_resources
+from state import MAX_STEPS, PipelineState, _resources, _run_config, _start_resources
 
 TASKS = Path(__file__).parent / "tasks.jsonl"
 RESULTS = Path(__file__).parent / "results"
@@ -50,6 +54,11 @@ RESULTS = Path(__file__).parent / "results"
 # a hard cap per task on top of the agent's own MAX_STEPS and node timeouts, so
 # one hung task can't stall the whole run
 TASK_TIMEOUT = 600
+
+# a fixed browser so runs compare: WebVoyager uses a 1024x768 window, so the
+# page area (and every screenshot) is 1024x768 here too. windowed rather than
+# headless: headless chrome is more often met with bot checks and captchas
+BROWSER = {"headless": False, "viewport": {"width": 1024, "height": 768}}
 
 # WebVoyager's own wording (WebVoyager-main/run.py)
 PROMPT = "Now given a task: {ques}  Please interact with {web} and get the answer."
@@ -111,6 +120,28 @@ def _tally(calls: list) -> dict:
     }
 
 
+# ── screenshots ──────────────────────────────────────────────────────────────
+# taken at the start of each plan step, so stepNN.png is the page the planner
+# read for step NN. wraps nodes.node_plan, which graph.py looks up when the
+# graph is built, so the agent itself is unchanged
+_screenshots: ContextVar[Path | None] = ContextVar("screenshots", default=None)
+_node_plan = nodes.node_plan
+
+
+async def _plan_with_screenshot(state, config):
+    folder = _screenshots.get()
+    if folder is not None:
+        session, _, _ = _resources(config)
+        try:
+            await session.take_screenshot(path=str(folder / f"step{state.get('step', 0) + 1:02d}.png"))
+        except Exception as e:
+            print(f"  (screenshot failed: {e!r})")
+    return await _node_plan(state, config)
+
+
+nodes.node_plan = _plan_with_screenshot
+
+
 # ── what each node did, from its state update ────────────────────────────────
 def _describe(node: str, update: dict | None) -> dict:
     update = update or {}
@@ -137,10 +168,13 @@ def _describe(node: str, update: dict | None) -> dict:
 
 
 # ── one task ─────────────────────────────────────────────────────────────────
-async def run_task(task: dict, repeat: int, steps_file) -> dict:
+async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
     calls: list = []
     token = _usage.set(calls)
-    session, tools, file_system = await _start_resources()
+    shots = out / "screenshots" / f"{task['id'].replace(' ', '_')}_r{repeat}"
+    shots.mkdir(parents=True)
+    shots_token = _screenshots.set(shots)
+    session, tools, file_system = await _start_resources(**BROWSER)
     start = time.perf_counter()
     state = {"last": start, "seen": 0, "steps": 0}
     status, answer, error = None, None, None
@@ -180,6 +214,11 @@ async def run_task(task: dict, repeat: int, steps_file) -> dict:
         status, error = "harness_error", repr(e)
     finally:
         _usage.reset(token)
+        _screenshots.reset(shots_token)
+        try:
+            await session.take_screenshot(path=str(shots / "final.png"))
+        except Exception as e:
+            print(f"  (final screenshot failed: {e!r})")
         try:
             await session.kill()
         except Exception:
@@ -190,6 +229,9 @@ async def run_task(task: dict, repeat: int, steps_file) -> dict:
         "ques": task["ques"], "reference": task["reference"],
         "reference_type": task["reference_type"],
         "answer": answer, "status": status, "error": error,
+        # anything but ok (step limit, timeout, failure) ended without an
+        # answer: a failure, as in WebVoyager. ok answers still need judging
+        "success": None if status == "ok" else 0,
         "steps": state["steps"], "seconds": round(time.perf_counter() - start, 1),
         **_tally(calls),
     }
@@ -220,7 +262,7 @@ def _config(args, tasks: list) -> dict:
         "use_vision": llm.USE_VISION, "vision": [llm.VISION_PROVIDER, llm.VISION_MODEL],
         "extraction": [llm.EXTRACTION_PROVIDER, llm.EXTRACTION_MODEL],
         "price_tuning": llm.PRICE_TUNING, "max_steps": MAX_STEPS, "task_timeout": TASK_TIMEOUT,
-        "browser_path": os.getenv("BROWSER_PATH"), "prices_usd_per_mtok": PRICES,
+        "browser_path": os.getenv("BROWSER_PATH"), "browser": BROWSER, "prices_usd_per_mtok": PRICES,
         "python": platform.python_version(),
         "packages": {p: version(p) for p in ("browser-use", "langgraph", "langchain-core", "pydantic")},
     }
@@ -258,7 +300,7 @@ async def main():
             for task in tasks:
                 n = len(results) + 1
                 print(f"\n=== [{n}/{total}] {task['id']} (repeat {repeat}) ===")
-                result = await run_task(task, repeat, steps_file)
+                result = await run_task(task, repeat, steps_file, out)
                 results.append(result)
                 tasks_file.write(json.dumps(result, default=str) + "\n")
                 tasks_file.flush()
@@ -271,7 +313,8 @@ async def main():
         writer = csv.writer(f)
         writer.writerow(columns + ["success", "notes"])
         for r in results:
-            writer.writerow([r[c] for c in columns] + ["", ""])
+            notes = "" if r["status"] == "ok" else f"status {r['status']}: no answer"
+            writer.writerow([r[c] for c in columns] + ["" if r["success"] is None else r["success"], notes])
 
     costs = [r["cost_usd"] for r in results if r["cost_usd"] is not None]
     print(f"\n{len(results)} runs | statuses: "
