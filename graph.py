@@ -1,46 +1,89 @@
 # wiring the nodes into the langgraph state machine.
 
-from typing import TypedDict
-
-from langgraph.graph import StateGraph, START
+from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import RetryPolicy, TimeoutPolicy
-from langgraph.errors import NodeError
+from langgraph.types import Command, RetryPolicy, TimeoutPolicy, default_retry_on
+from langgraph.errors import NodeError, NodeTimeoutError
 
-from state import PipelineState
+from llm import LLMLimitError
+from state import PipelineState, MAX_STEPS
 import nodes  # reference nodes.node_* so tests can monkeypatch them
 
 
-# TODO: define status & default error handler
-# START: error handling placeholder
-class State(TypedDict):
-    status: str
+# ── error handling ───────────────────────────────────────────────────────────
+# what the user is told for each failure status. plain language, said aloud to a
+# BLV user, so: what happened, and whether anything more was done on the page.
+# the technical detail goes to the console only
+FAILURE_MESSAGES = {
+    "timed_out": "Sorry, that was taking too long, so I stopped the task. "
+                 "I didn't do anything more on the page.",
+    "rate_limited": "Sorry, I've hit the usage limit for the AI service, so I "
+                    "stopped the task. Please try again in a few minutes.",
+    "llm_failed": "Sorry, something went wrong while I was working out what to "
+                  "do, so I stopped the task. I didn't do anything more on the "
+                  "page. You can try asking again.",
+    "execute_failed": "Sorry, I couldn't carry out an action on the page, even "
+                      "after trying a different way, so I stopped the task. The "
+                      "last action may not have gone through.",
+    "failed": "Sorry, something went wrong, so I stopped the task. You can try "
+              "asking again.",
+}
 
-def default_error_handler(state: State, error: NodeError) -> State:
-    return {"status": f"handled: {error.error}"}
-# END: error handling placeholder
 
-def build_workflow():
-    g: StateGraph[PipelineState] = StateGraph(PipelineState)
+def _failure_status(error: NodeError) -> str:
+    if isinstance(error.error, NodeTimeoutError):
+        return "timed_out"
+    if isinstance(error.error, LLMLimitError):
+        return "rate_limited"
+    if error.node == "execute":
+        return "execute_failed"
+    if error.node in ("respond", "plan", "analyse"):
+        return "llm_failed"
+    return "failed"
 
-    g.set_node_defaults(
-        retry_policy=RetryPolicy(max_attempts=3),
-        error_handler=default_error_handler,
-        timeout=TimeoutPolicy(run_timeout=30),
-    )
 
-    g.add_node("respond", nodes.node_respond)
-    g.add_node("plan", nodes.node_plan)
-    g.add_node("analyse", nodes.node_analyse)
-    g.add_node("execute", nodes.node_execute)
-    g.add_node("resolve", nodes.node_resolve)
+def _retry_on(exc: Exception) -> bool:
+    # langgraph's default rules, minus timeouts: a hung call retried 3× freezes
+    # the agent for minutes before the user hears anything
+    return not isinstance(exc, NodeTimeoutError) and default_retry_on(exc)
 
-    # constant (conditional edges return the edge they go to)
-    g.add_edge("START", "respond")
-    g.add_edge("plan", "analyse")
-    g.add_edge("execute", "resolve")
-    memory = InMemorySaver()
-    return g.compile(checkpointer=memory)
+
+async def default_error_handler(state: PipelineState, error: NodeError) -> Command:
+    # runs once a node has failed for good (after its retries). execute failures
+    # go back to the planner once, as the game plan says: it re-reads the page,
+    # so it notices if the action went through anyway. everything else ends the
+    # task: tell the user why, and reset the per-task state like resolve does so
+    # the next prompt starts clean
+    status = _failure_status(error)
+    scratch = state.get("scratch", [])
+    print("── error ────────────────────────────────")
+    print(f"  failed:   {error.node} ({status})")
+    print(f"  error:    {error.error!r}")
+
+    if error.node == "execute":
+        decision = state.get("last_decision")
+        action = decision.model_dump(exclude_none=True, exclude={"reasoning"}) if decision else {}
+        # retry via the planner only if the previous action didn't fail too, and
+        # there are steps left (resolve, which enforces MAX_STEPS, gets skipped)
+        if not (scratch and scratch[-1].get("failed")) and state.get("step", 0) < MAX_STEPS:
+            what = "timed out" if status == "timed_out" else "failed"
+            entry = {"action": action, "failed": True,
+                     "outcome": f"error: this action {what} ({type(error.error).__name__}); "
+                                f"check the page, it may or may not have gone through"}
+            print("  next:     back to plan")
+            return Command(goto="plan", update={"scratch": scratch + [entry]})
+        status = "execute_failed"
+
+    message = FAILURE_MESSAGES[status]
+    print(f"  told user: {message}")
+    return Command(goto=END, update={
+        "messages": [{"role": "assistant", "content": message}],
+        "status": status,
+        "step": 0,
+        "done": False,
+        "scratch": [],
+    })
+
 
 # ── the actual agent loop (with chat memory) ─────────────────────────────────
 '''
@@ -67,10 +110,16 @@ def build_workflow():
 '''
 def build_agent():
     g: StateGraph[PipelineState] = StateGraph(PipelineState)
+    
+    g.set_node_defaults(
+        retry_policy=RetryPolicy(max_attempts=3, retry_on=_retry_on),
+        error_handler=default_error_handler,
+        timeout=TimeoutPolicy(run_timeout=30),
+    )
     g.add_node("respond", nodes.node_respond)  # front desk; routes plan | END via Command
     g.add_node("plan", nodes.node_plan)
-    g.add_node("analyse", nodes.node_analyse)  # verify before acting; routes execute | plan
-    g.add_node("execute", nodes.node_execute)
+    g.add_node("analyse", nodes.node_analyse)  # verify before acting; routes execute | plan | resolve
+    g.add_node("execute", nodes.node_execute, retry_policy=RetryPolicy(max_attempts=1))
     g.add_node("resolve", nodes.node_resolve)  # routes plan | END via Command
     g.add_edge(START, "respond")
     g.add_edge("plan", "analyse")

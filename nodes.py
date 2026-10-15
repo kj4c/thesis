@@ -1,6 +1,5 @@
 # the graph nodes — respond, plan, analyse, execute, resolve — plus the schemas
-# and prompts they use. also keeps the original design stubs (superseded by the
-# node_* functions below, but left in as the design sketch).
+# and prompts they use.
 
 from typing import Literal, Any
 
@@ -14,78 +13,6 @@ from browser_use.llm.messages import SystemMessage, UserMessage
 
 from llm import make_planner_llm, _ainvoke_with_retry
 from state import PipelineState, MAX_STEPS, _resources
-
-# ── Node 1: Conversational Node  ─────────────────────────────────────────────
-'''
-    This one is for questions like 'what is on this page' and 'where is the
-    search bar'? May include an option to ask user if they want to switch to
-    'executive mode' if it sounds like they want a specific task done.
-
-    Potentially can be reused to judge what went wrong for a task after human
-    approval is denied.
-'''
-async def respond(query: str) -> str:
-    ... # TODO
-
-def is_task(query: str) -> bool:
-    # either LLM or action, depending on how we implement it
-    ... # TODO
-
-# ── Node 2: plan ──────────────────────────────────────────────---------------
-'''
-    As I see it, this is for collecting the vision-based coord mapping &
-    text-only DOM for the next node by just hitting both AI with the OG query
-    (and potentially the plan, or even information from the database to catch
-    disruptions, e.g. popus, 404s). Its main point is to notice if there's a
-    disruption and verify that the AI are mostly in agreement, or close to.
-
-    Might split the node into one for VBC & one for DOM (AKA one for each AI).
-
-    RE: plan/database as arguments, may be good to add for context, but we
-    then have to figure the function overload, shape of the query & how to
-    format either option.
-
-    RE: verification, may create an extra node or cut it out and double down
-    in next node instead of verifying within this node.
-
-'''
-async def plan(query: str) -> str:
-    ... # TODO
-
-# ── Node 3: analyse ──────────────────────────────────────────────────────────
-'''
-    Takes query and updated response to query (or specific step, still not
-    clear on that detail), confirms (re-verifies) consensus and checks if
-    approval is needed (based on user preference and verification result).
-
-    Assume we choose 1 of the two AI for this node.
-'''
-async def analyse(query: str, perception_data: str) -> str:
-    ... # TODO
-
-def ask_approval(question: str) -> bool:
-    # user input
-    ... # TODO
-
-# ── Node 4: execute ──────────────────────────────────────────────────────────
-'''
-    Self-explanatory, no AI, just browser control and a defined error class.
-
-    Might just be a function instead, need to revisit what defines a node.
-'''
-async def execute(query: str, perception_data: str) -> str:
-    ... # TODO
-
-# ── Node 5: resolve ──────────────────────────────────────────────────────────
-'''
-    Primarily saving information to the database and training data. Might need
-    AI to intuit what it should save? I don't know about that.
-
-    Also, depending on how the edges work, this node may define if the
-    graph goes to END now.
-'''
-async def resolve(query: str, success: str) -> str:
-    ... # TODO
 
 # ── LangGraph workflow ───────────────────────────────────────────────────────
 
@@ -139,7 +66,10 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
     # a question / chat — answer it and go back to listening
     answer = decision.answer or "(no answer)"
     print(f"\nrespond: {answer}")
-    return Command(goto=END, update={"messages": [{"role": "assistant", "content": answer}]})
+    return Command(goto=END, update={
+        "messages": [{"role": "assistant", "content": answer}],
+        "status": "ok",
+    })
 
 # what the planner has to return: exactly one next action. kept deliberately
 # small (5 actions) so the schema + prompt stay readable for the MVP; production
@@ -303,7 +233,7 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> PipelineSta
     print(f"\nStep {step} — plan: {decision.action} :: {decision.reasoning}")
     return {"last_decision": decision, "step": step}
 
-async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan"]]:
+async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan", "resolve"]]:
     # independently verify the planned action before it runs. this is the seed of
     # the per-step verification gate — one channel for now (a DOM-based verifier),
     # and once a vision channel is added it becomes the DOM-vs-vision consensus gate
@@ -368,7 +298,14 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # matches the loop guard above so a repeat of this exact action is caught.
     print(f"  analyse: ✗ REJECTED :: {verdict.reason}")
     entry = {"action": rej_key, "outcome": f"verifier rejected: {verdict.reason}"}
-    return Command(goto="plan", update={"scratch": state.get("scratch", []) + [entry]})
+    scratch = state.get("scratch", []) + [entry]
+    # a rejection loops back to plan without passing resolve, which is what
+    # enforces MAX_STEPS. so check it here: without this, a planner that keeps
+    # proposing *different* rejected actions runs into langgraph's recursion
+    # limit, which the error handler can't catch
+    if state.get("step", 0) >= MAX_STEPS:
+        return Command(goto="resolve", update={"scratch": scratch})
+    return Command(goto="plan", update={"scratch": scratch})
 
 async def node_execute(state: PipelineState, config: RunnableConfig) -> PipelineState:
     # run the action the planner chose. just browser-use's hands 
@@ -417,7 +354,13 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
 
     if finished:
         reason = "task done" if state.get("done") else f"hit MAX_STEPS ({MAX_STEPS})"
-        answer = getattr(result, "extracted_content", None) or reason
+        if state.get("done"):
+            answer = getattr(result, "extracted_content", None) or reason
+        else:
+            # said aloud to the user, so plain language, not the console reason.
+            # never the last action's result: that isn't an answer to the task
+            answer = (f"Sorry, I couldn't finish this within {MAX_STEPS} steps, so I "
+                      f"stopped. You could try asking in a simpler or more specific way.")
         print("── resolve ──────────────────────────────")
         print(f"  finished: {reason}")
         print(f"  result:   {answer}")
@@ -426,6 +369,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
             "step": 0,
             "done": False,
             "scratch": [],  # clear the within-task memory for the next task
+            "status": "ok" if state.get("done") else "max_steps",
         })
 
     # not done — go plan the next step

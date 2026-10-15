@@ -10,12 +10,14 @@ load_dotenv()
 
 # ── planner model ─────────────────────────────────────────────────────────────
 # pick the provider/model with .env (PLANNER_PROVIDER, and OLLAMA/GROQ/CLAUDE_MODEL)
-PLANNER_PROVIDER = os.getenv("PLANNER_PROVIDER", "groq").lower()
+# anthropic / claude-sonnet-5-5 is the baseline model: every evaluation run from
+# the baseline on uses it, so results are comparable. other providers are dev-only
+PLANNER_PROVIDER = os.getenv("PLANNER_PROVIDER", "anthropic").lower()
 
 PLANNER_MODELS = {
     "ollama": os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
     "groq": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
-    "anthropic": os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+    "anthropic": os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5"),
     "gemini": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
 }
 
@@ -30,9 +32,14 @@ def make_planner_llm():
     if provider == "groq":
         return ChatGroq(model=model, api_key=os.getenv("GROQ_API_KEY"))
     if provider == "anthropic":
+        # thinking must be set: without it browser_use forces the structured-output
+        # tool, which sonnet 5.5 rejects (400). effort is fixed so runs are comparable
+        # (thinking is billed as output). no temperature: sonnet 5.5 rejects it
         return ChatAnthropic(
             model=model,
             api_key=os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
+            thinking={"type": "adaptive"},
+            output_config={"effort": os.getenv("CLAUDE_EFFORT", "medium")},
         )
     if provider == "gemini":
         return ChatGoogle(
@@ -42,6 +49,18 @@ def make_planner_llm():
     raise ValueError(
         f"Unknown PLANNER_PROVIDER {provider!r}; use ollama | groq | anthropic | gemini"
     )
+
+
+# longest rate-limit wait _ainvoke_with_retry backs off for before giving up.
+# keep it under the node timeout in graph.py (30s)
+MAX_RATE_LIMIT_WAIT = 20
+
+
+class LLMLimitError(RuntimeError):
+    # rate/quota limit that backing off won't fix. its own class so the graph's
+    # error handler can tell the user "usage limit" instead of a generic failure.
+    # a RuntimeError, so langgraph's default retry_on doesn't retry it
+    pass
 
 
 def _parse_retry_seconds(msg: str) -> float | None:
@@ -71,18 +90,21 @@ async def _ainvoke_with_retry(llm, messages, output_format, attempts: int = 4):
             wait = _parse_retry_seconds(msg)
             hard_cap = "limit: 0" in msg
 
-            # a long wait also means a per-day / big-window cap; backing off won't help
-            if hard_cap or wait is None or wait > 120 or i == attempts - 1:
+            # a long wait also means a per-day / big-window cap; backing off won't help.
+            # capped at 20s so the wait fits inside the 30s node timeout (graph.py):
+            # a longer one would be cut off and reported as timed_out, not rate_limited
+            if hard_cap or wait is None or wait > MAX_RATE_LIMIT_WAIT or i == attempts - 1:
                 model = getattr(llm, "model", "the model")
                 if hard_cap:
-                    raise RuntimeError(
+                    raise LLMLimitError(
                         f"No quota for {model} on this key (free-tier limit is 0). "
                         f"Try a different model (e.g. GEMINI_MODEL=gemini-2.5-flash), a "
                         f"fresh key from https://aistudio.google.com/apikey, or set "
                         f"PLANNER_PROVIDER=ollama (local, unlimited) in .env."
                     ) from e
-                hint = f" (resets in ~{wait / 60:.0f}m)" if wait else ""
-                raise RuntimeError(
+                hint = (f" (resets in ~{wait:.0f}s)" if wait and wait < 120
+                        else f" (resets in ~{wait / 60:.0f}m)" if wait else "")
+                raise LLMLimitError(
                     f"Rate/token limit hit on {model}{hint}. Likely the free daily "
                     f"budget is spent. Options: set PLANNER_PROVIDER=ollama (local, "
                     f"unlimited) in .env, switch GROQ_MODEL (e.g. openai/gpt-oss-20b), "

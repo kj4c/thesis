@@ -1,6 +1,7 @@
 # the shared pipeline state + the runtime resources nodes and runners both need.
 
 import operator
+import os
 import tempfile
 from typing import TypedDict, Annotated, Any
 
@@ -33,6 +34,12 @@ class PipelineState(TypedDict, total=False):
     # forever)
     # different from `messages`, which is the cross-turn chat memory.
     scratch: list[dict]
+
+    # how the last turn ended, for the UI / logs (placeholder set).
+    # set by respond/resolve on a normal finish and by
+    # graph.default_error_handler on a failure:
+    #   ok | max_steps | timed_out | rate_limited | llm_failed | execute_failed | failed
+    status: str
     '''
     TODO:
     properties that update as it progresses based on current node plan
@@ -51,7 +58,12 @@ def _resources(config: RunnableConfig) -> tuple[BrowserSession, Tools, FileSyste
 async def _start_resources() -> tuple[BrowserSession, Tools, FileSystem]:
     # spin up the per-run resources: a live browser (kept alive so follow-ups
     # reuse the page), the action executor, and a scratch filesystem 
-    session = BrowserSession(keep_alive=True)
+    # BROWSER_PATH (optional, .env) pins the browser binary: browser_use misses
+    # newer playwright chromium ("Google Chrome for Testing.app"), and a fixed
+    # browser keeps evaluation runs comparable. unset = browser_use's own search
+    browser_path = os.getenv("BROWSER_PATH")
+    session = BrowserSession(keep_alive=True, executable_path=browser_path) if browser_path \
+        else BrowserSession(keep_alive=True)
     await session.start()
     tools = Tools()
     file_system = FileSystem(tempfile.mkdtemp(prefix="mvp_fs_"))

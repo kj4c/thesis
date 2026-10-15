@@ -8,17 +8,8 @@ import time
 from langchain_core.runnables import RunnableConfig
 
 import llm  # for PLANNER_PROVIDER / PLANNER_MODELS (to report the model in use)
-from graph import build_agent, build_workflow
+from graph import build_agent
 from state import _start_resources, _run_config
-
-
-async def run_pipeline(query: str):
-    # TODO: connect to UI properly once it is finished
-    workflow = build_workflow()
-    config: RunnableConfig = {"configurable": {"thread_id": "1"}}
-    # note: the async entrypoint is `ainvoke`, not `invoke`
-    await workflow.ainvoke({"query": query}, config)
-
 
 async def run_turn(workflow, query: str, config: RunnableConfig):
     # run one user turn. the user message gets appended to the saved transcript
