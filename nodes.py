@@ -180,6 +180,12 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "Only navigate to a url the user gave you or a well-known site — NEVER invent a "
     "shop/product url. If a navigation FAILS (can't resolve), don't retry it — go "
     "to a Google search URL instead.\n\n"
+    "REGIONAL SITES: if a site sends you to a regional version (e.g. amazon.com.au) "
+    "or shows prices in another currency, stay on it and work in the currency it "
+    "shows. Do NOT try to change the delivery country, region or currency: those "
+    "menus open pop-ups that block the page and waste steps. Read any price limits "
+    "in the task as amounts in the site's currency, and say in your answer which "
+    "site and currency the prices are from.\n\n"
     "POPUPS / OVERLAYS come FIRST. Cookie-consent, privacy, newsletter, region, or "
     "app-install banners sit on top of the page and block everything underneath — "
     "clicks on elements below them silently fail or time out. If the elements list "
@@ -237,7 +243,11 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "NEVER reject based on WHICH SITE or DOMAIN the page is on. A regional mirror "
     "(amazon.com vs amazon.com.au, google.com vs google.co.uk) is FINE — the task "
     "can be completed on any equivalent site, so the specific domain is irrelevant. "
-    "Do not demand the agent return to some 'original' domain.\n\n"
+    "Do not demand the agent return to some 'original' domain. The same goes for "
+    "CURRENCY: prices in the site's own currency (e.g. AUD on amazon.com.au) are "
+    "FINE. Read a price range in the task as amounts in the site's currency; never "
+    "reject because the currency differs from the task's, and never ask the agent "
+    "to change the delivery country, region or currency.\n\n"
     "If an OVERLAY / MODAL / interstitial / cookie or region banner is blocking the "
     "page, APPROVE any reasonable action that dismisses or closes it — clicking ×, "
     "Close, Dismiss, Continue, Accept, or ANY of the modal's own buttons. Getting "
@@ -291,6 +301,15 @@ VISION_VERIFIER_SYSTEM = SystemMessage(content=(
 ))
 
 
+# said aloud when the agent stops itself (a loop guard, or an action it couldn't
+# build): plain language, like graph.FAILURE_MESSAGES. the technical reason goes
+# to the console only
+STUCK_MESSAGE = ("Sorry, I got stuck and couldn't finish this, so I stopped. "
+                 "You could try asking in a simpler or more specific way.")
+BAD_ACTION_MESSAGE = ("Sorry, I couldn't work out the next step, so I stopped. "
+                      "You could try asking again.")
+
+
 def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
     # turn the planner's PlanDecision into a real browser-use ActionModel. if a
     # required field is missing we fall back to `done` so a bad decision stops the
@@ -310,7 +329,8 @@ def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
         return AM.model_validate({"done": {"text": d.text or "done", "success": d.success}})
     # malformed action (e.g. click with no index) -> stop gracefully
     stop = tools.registry.create_action_model(include_actions=["done"])
-    return stop.model_validate({"done": {"text": f"stopping: incomplete action {d.action!r}", "success": False}})
+    print(f"  ⚠ incomplete action {d.action!r}, stopping")
+    return stop.model_validate({"done": {"text": BAD_ACTION_MESSAGE, "success": False}})
 
 
 # how much of an action's outcome the planner sees in the actions-taken list.
@@ -477,12 +497,12 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
                     stop = PlanDecision(reasoning="returning best price found", action="done", text=answer)
                     return Command(goto="execute", update={"last_decision": stop})
             last_reason = scratch[last_rej_idx].get("outcome", "the action was rejected repeatedly")
-            print("  analyse → stop (same action rejected twice)")
+            print(f"  analyse → stop (same action rejected twice): {last_reason[:120]}")
             stop = PlanDecision(
                 reasoning="stuck: the gate rejected the same action repeatedly",
                 action="done",
                 success=False,
-                text=f"couldn't complete this — {last_reason[:80]}",
+                text=STUCK_MESSAGE,
             )
             return Command(goto="execute", update={"last_decision": stop})
 
@@ -562,7 +582,7 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
             reasoning="loop guard: same action repeated without progress",
             action="done",
             success=False,
-            text="stopped: the agent kept repeating the same action without making progress",
+            text=STUCK_MESSAGE,
         ))
         action_dump = action.model_dump(exclude_unset=True)
         action_name = next(iter(action_dump), "")
@@ -588,6 +608,14 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
     entry = {"action": action_dump, "outcome": str(outcome)[:limit]}
     scratch = state.get("scratch", []) + [entry]
     return {"last_result": result, "done": done, "scratch": scratch}
+
+def _finish_status(done: bool, result: Any) -> str:
+    # done with success=False means the task wasn't completed: the planner gave
+    # up honestly, or a loop guard stopped it. only a successful done is "ok"
+    if not done:
+        return "max_steps"
+    return "gave_up" if getattr(result, "success", None) is False else "ok"
+
 
 async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__"]]:
     result = state.get("last_result")
@@ -623,7 +651,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
             "step": 0,
             "done": False,
             "scratch": [],  # clear the within-task memory for the next task
-            "status": "ok" if state.get("done") else "max_steps",
+            "status": _finish_status(state.get("done", False), result),
         })
 
     # not done — go plan the next step

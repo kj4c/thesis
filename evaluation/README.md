@@ -25,8 +25,8 @@ success is judged by a person, as in WebVoyager's human evaluation: look at
 the task's screenshots, supplemented by the agent's step log, and decide
 whether it did what the task asked. record it in the run's `summary.csv`.
 
-- **already scored**: a task that didn't end with status `ok` (step limit,
-  timeout, failure) has `success` 0. only the rest need reviewing.
+- **already scored**: a task that didn't end with status `ok` (gave up, step
+  limit, timeout, failure) has `success` 0. only the rest need reviewing.
 - **where to look**: `screenshots/<task>_r<repeat>/` (`stepNN.png` is the page
   the planner read at step NN, `final.png` the page at the end) and that
   task's lines in `steps.jsonl` (each step's action, reasoning and outcome).
@@ -40,7 +40,9 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   screenshots show the current one, accept it and say so in `notes`.
 - **Amazon**: judge whether the answer meets the task's conditions on the
   store the agent was sent to (see the redirect note below), not whether it
-  matches the reference product.
+  matches the reference product. price ranges are read in the store's own
+  currency ("$100 to $200" means A$100–200 on amazon.com.au), which is also
+  what the agent is told to do.
 - **notes**: one line on why, for every 0 and for any judgement call.
 
 if two people are available, have both score the same few runs independently

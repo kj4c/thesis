@@ -40,7 +40,9 @@ class PipelineState(TypedDict, total=False):
     # how the last turn ended, for the UI / logs (placeholder set).
     # set by respond/resolve on a normal finish and by
     # graph.default_error_handler on a failure:
-    #   ok | max_steps | timed_out | rate_limited | llm_failed | execute_failed | failed
+    #   ok | gave_up | max_steps | timed_out | rate_limited | llm_failed | execute_failed | failed
+    # gave_up: the agent stopped itself without completing the task (done with
+    # success=False, from the planner or a loop guard)
     status: str
     '''
     TODO:
