@@ -16,6 +16,7 @@ from browser_use.llm.messages import (
 
 from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry
 from state import PipelineState, MAX_STEPS, _resources
+from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
 # ── LangGraph workflow ───────────────────────────────────────────────────────
 
@@ -66,7 +67,7 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
     # a question / chat — answer it and go back to listening
     answer = decision.answer or "(no answer)"
     print(f"\nrespond: {answer}")
-    return Command(goto=END, update={
+    return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
         "messages": [{"role": "assistant", "content": answer}],
         "status": "ok",
     })
@@ -273,20 +274,20 @@ def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
     # run cleanly instead of blowing up mid-loop.
     AM = tools.registry.create_action_model(include_actions=[d.action])
     if d.action == "navigate" and d.url:
-        return AM(navigate={"url": d.url, "new_tab": False})
+        return AM.model_validate({"navigate": {"url": d.url, "new_tab": False}})
     if d.action == "click" and d.index is not None:
-        return AM(click={"index": d.index})
+        return AM.model_validate({"click": {"index": d.index}})
     if d.action == "input" and d.index is not None and d.text is not None:
-        return AM(input={"index": d.index, "text": d.text})
+        return AM.model_validate({"input": {"index": d.index, "text": d.text}})
     if d.action == "scroll":
-        return AM(scroll={"down": d.down if d.down is not None else True})
+        return AM.model_validate({"scroll": {"down": d.down if d.down is not None else True}})
     if d.action == "extract" and d.text:
-        return AM(extract={"query": d.text})
+        return AM.model_validate({"extract": {"query": d.text}})
     if d.action == "done":
-        return AM(done={"text": d.text or "done", "success": d.success})
+        return AM.model_validate({"done": {"text": d.text or "done", "success": d.success}})
     # malformed action (e.g. click with no index) -> stop gracefully
     stop = tools.registry.create_action_model(include_actions=["done"])
-    return stop(done={"text": f"stopping: incomplete action {d.action!r}", "success": False})
+    return stop.model_validate({"done": {"text": f"stopping: incomplete action {d.action!r}", "success": False}})
 
 
 def _format_history(messages: list[dict], limit: int = 6) -> str:
@@ -315,7 +316,7 @@ def _format_scratch(scratch: list[dict], limit: int = 10) -> str:
     )
 
 
-async def node_plan(state: PipelineState, config: RunnableConfig) -> PipelineState:
+async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
     # read the page, ask the model for the next action. perception (DOM +
     # screenshot) comes from browser-use; the decision comes from our own llm
     # call, which is the whole point of owning the loop. we also feed in the
@@ -388,11 +389,11 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
         return None
 
 
-async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan"]]:
+async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan", "resolve"]]:
     # verify before consequential actions (click, done). DOM is the decision;
     # vision notes overlay issues but does not block when DOM already approved —
     # otherwise a visible popup rejects a valid done answer and the agent loops.
-    decision: PlanDecision = state["last_decision"]
+    decision: PlanDecision = state["last_decision"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  (always set by plan)
 
     if decision.action not in ("click", "done"):
         return Command(goto="execute")
@@ -486,10 +487,10 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
         return Command(goto="resolve", update={"scratch": scratch})
     return Command(goto="plan", update={"scratch": scratch})
 
-async def node_execute(state: PipelineState, config: RunnableConfig) -> PipelineState:
+async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
     # run the action the planner chose. just browser-use's hands 
     session, tools, file_system = _resources(config)
-    action = _decision_to_action(tools, state["last_decision"])
+    action = _decision_to_action(tools, state["last_decision"])  # pyright: ignore[reportTypedDictNotRequiredAccess]  (always set by plan)
 
     # loop guard: if the planner picks the same action a 3rd time it's spinning
     # (navigate→click→navigate…), so force a clean stop. scroll is exempt since
@@ -557,7 +558,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
         if price_from_text(content):
             answer = compact_glasses_reply(query, str(content))
             print(f"  done (early): {answer}")
-            return Command(goto=END, update={
+            return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
                 "messages": [{"role": "assistant", "content": answer}],
                 "step": 0, "done": False, "scratch": [],
             })
@@ -573,7 +574,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
                       f"stopped. You could try asking in a simpler or more specific way.")
         answer = compact_glasses_reply(query, str(answer))
         print(f"  done: {answer}")
-        return Command(goto=END, update={
+        return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
             "messages": [{"role": "assistant", "content": str(answer)}],
             "step": 0,
             "done": False,

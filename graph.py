@@ -2,7 +2,9 @@
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command, RetryPolicy, TimeoutPolicy, default_retry_on
+from langgraph.types import Command, RetryPolicy, TimeoutPolicy
+# RetryPolicy's own default, but missing from langgraph.types' __all__
+from langgraph.types import default_retry_on  # pyright: ignore[reportPrivateImportUsage]
 from langgraph.errors import NodeError, NodeTimeoutError
 
 from llm import LLMLimitError
@@ -113,7 +115,8 @@ def build_agent():
     
     g.set_node_defaults(
         retry_policy=RetryPolicy(max_attempts=3, retry_on=_retry_on),
-        error_handler=default_error_handler,
+        # langgraph's type hint misses its own documented (state, error: NodeError) form
+        error_handler=default_error_handler,  # pyright: ignore[reportArgumentType]
         timeout=TimeoutPolicy(run_timeout=30),
     )
     g.add_node("respond", nodes.node_respond)  # front desk; routes plan | END via Command
@@ -124,7 +127,4 @@ def build_agent():
     g.add_edge(START, "respond")
     g.add_edge("plan", "analyse")
     g.add_edge("execute", "resolve")
-    # InMemorySaver keeps state between prompts within one process run, keyed by
-    # thread_id — that's what gives us conversation memory. state stays fully
-    # serialisable because the resources live in config, not state.
     return g.compile(checkpointer=InMemorySaver())

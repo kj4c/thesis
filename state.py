@@ -3,7 +3,7 @@
 import operator
 import os
 import tempfile
-from typing import TypedDict, Annotated, Any
+from typing import TypedDict, Annotated, Any, Required
 
 from langchain_core.runnables import RunnableConfig
 from browser_use import BrowserSession, Tools, ActionResult
@@ -14,8 +14,9 @@ MAX_STEPS = 12
 
 
 class PipelineState(TypedDict, total=False):
-    # the current user turn (latest natural language input)
-    query: str
+    # the current user turn (latest natural language input). Required: every
+    # entry point (mvp.py, serve.py, the gui) sends it with each turn
+    query: Required[str]
 
     # chat memory
     messages: Annotated[list[dict], operator.add]
@@ -49,7 +50,7 @@ class PipelineState(TypedDict, total=False):
     '''
 
 
-def _resources(config: RunnableConfig) -> tuple[BrowserSession, Tools, FileSystem]:
+def _resources(config: RunnableConfig | None) -> tuple[BrowserSession, Tools, FileSystem]:
     # grab the live browser + executor + filesystem out of config 
     cfg = (config or {}).get("configurable", {})
     return cfg["session"], cfg["tools"], cfg["file_system"]

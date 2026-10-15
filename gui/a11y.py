@@ -1,4 +1,7 @@
 # screen reader support (VoiceOver on macos)
+# pyobjc's AppKit/objc are generated at runtime and ship no type info, so the
+# checker can't see their members; every use below is guarded by `AppKit is None`
+# pyright: reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
 
 import wx
 

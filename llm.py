@@ -2,9 +2,16 @@
 
 import asyncio
 import os
+from typing import TypeVar
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from browser_use import ChatAnthropic, ChatGoogle, ChatGroq, ChatOllama
+from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.messages import BaseMessage
+from browser_use.llm.views import ChatInvokeCompletion
+
+T = TypeVar("T", bound=BaseModel)
 
 load_dotenv()
 
@@ -17,7 +24,7 @@ def _provider(name: str) -> str:
 # pick the provider/model with .env (PLANNER_PROVIDER, and OLLAMA/GROQ/CLAUDE_MODEL)
 # anthropic / claude-sonnet-5-5 is the baseline model: every evaluation run from
 # the baseline on uses it, so results are comparable. other providers are dev-only
-PLANNER_PROVIDER = os.getenv("PLANNER_PROVIDER", "anthropic").lower()
+PLANNER_PROVIDER = _provider(os.getenv("PLANNER_PROVIDER", "anthropic"))
 
 PLANNER_MODELS = {
     "ollama": os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
@@ -54,7 +61,8 @@ def _build_llm(provider: str, model: str):
 
 def make_planner_llm():
     # the planner / DOM-verifier model (text). one place to choose it
-    return _build_llm(PLANNER_PROVIDER, PLANNER_MODELS.get(PLANNER_PROVIDER))
+    # unknown provider -> "" here, and _build_llm raises a clear error for it
+    return _build_llm(PLANNER_PROVIDER, PLANNER_MODELS.get(PLANNER_PROVIDER, ""))
 
 
 # ── vision model  ──────────
@@ -63,7 +71,9 @@ USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
 VISION_PROVIDER = _provider(os.getenv("VISION_PROVIDER", "anthropic"))
 _VISION_DEFAULTS = {
     "gemini": "gemini-3.5-flash",
-    "anthropic": "claude-sonnet-4-5-20250929",
+    # same as the planner: _build_llm turns on adaptive thinking for anthropic,
+    # which older claude models reject (400), and one model keeps evaluation comparable
+    "anthropic": "claude-sonnet-5-5",
     "ollama": "qwen2.5vl:7b",
     "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
 }
@@ -81,7 +91,7 @@ def make_vision_llm():
 GLASSES_VISION_PROVIDER = _provider(os.getenv("GLASSES_VISION_PROVIDER", "anthropic"))
 GLASSES_VISION_MODEL = os.getenv(
     "GLASSES_VISION_MODEL",
-    _VISION_DEFAULTS.get(GLASSES_VISION_PROVIDER, "claude-sonnet-4-5-20250929"),
+    _VISION_DEFAULTS.get(GLASSES_VISION_PROVIDER, "claude-sonnet-5-5"),
 )
 
 
@@ -93,7 +103,7 @@ def make_glasses_vision_llm():
 # ── extraction model (for the `extract` action) ──────────────────────────────
 # extract sends the WHOLE page to the model, so it needs a big context + generous
 # rate limit. the planner model can be too small. defaults to the vision model
-# (gemini), independently overridable via EXTRACTION_PROVIDER / EXTRACTION_MODEL.
+# (claude-sonnet-5-5 by default), independently overridable via EXTRACTION_PROVIDER / EXTRACTION_MODEL.
 EXTRACTION_PROVIDER = _provider(os.getenv("EXTRACTION_PROVIDER", VISION_PROVIDER))
 EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", VISION_MODEL)
 
@@ -124,7 +134,8 @@ def _parse_retry_seconds(msg: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-async def _ainvoke_with_retry(llm, messages, output_format, attempts: int = 4):
+async def _ainvoke_with_retry(llm: BaseChatModel, messages: list[BaseMessage],
+                              output_format: type[T], attempts: int = 4) -> ChatInvokeCompletion[T]:
     # call an llm for structured output. backs off on short (per-minute) rate
     # limits; on a long/daily cap it raises a clear error instead of a stack
     # trace. works across providers 
@@ -162,3 +173,5 @@ async def _ainvoke_with_retry(llm, messages, output_format, attempts: int = 4):
                 ) from e
             print(f"  rate-limited; waiting {wait:.0f}s then retrying…")
             await asyncio.sleep(wait + 1)
+    # unreachable: the last attempt either returns or raises above
+    raise RuntimeError("_ainvoke_with_retry: no attempts made")

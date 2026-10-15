@@ -64,7 +64,7 @@ def _lan_ip() -> str:
         s.close()
 
 
-async def _register_mdns(port: int) -> AsyncZeroconf:
+async def _register_mdns(port: int) -> tuple[AsyncZeroconf, ServiceInfo]:
     # advertise the server over mdns so the phone app can find it by name
     # (e.g. "Glasses Agent._http._tcp.local.") without a hardcoded ip.
     ip = _lan_ip()
@@ -78,9 +78,8 @@ async def _register_mdns(port: int) -> AsyncZeroconf:
     )
     azc = AsyncZeroconf()
     await azc.async_register_service(info)
-    azc.info = info
     print(f"[glasses] mdns: discoverable as '{SERVICE_NAME}' at {ip}:{port}")
-    return azc
+    return azc, info
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -153,7 +152,7 @@ async def start_background(app: web.Application):
     app["workflow"] = build_agent()
     app["config"] = _run_config(session, tools, file_system, THREAD_ID)
     app["lock"] = asyncio.Lock()
-    app["mdns"] = await _register_mdns(app["port"])
+    app["mdns"], app["mdns_info"] = await _register_mdns(app["port"])
     print(f"planner: {llm.PLANNER_PROVIDER} / "
           f"{llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER, '?')}")
     print(f"glasses vision: {llm.GLASSES_VISION_PROVIDER} / {llm.GLASSES_VISION_MODEL}")
@@ -162,7 +161,7 @@ async def start_background(app: web.Application):
 async def cleanup_background(app: web.Application):
     azc = app.get("mdns")
     if azc is not None:
-        await azc.async_unregister_service(azc.info)
+        await azc.async_unregister_service(app["mdns_info"])
         await azc.async_close()
     print("closing browser…")
     await app["session"].kill()

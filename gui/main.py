@@ -16,7 +16,7 @@ from graph import build_agent
 from mvp import last_assistant_reply
 from nodes import _decision_to_action
 from reply_format import compact_glasses_reply
-from state import _resources, _run_config, _start_resources
+from state import PipelineState, _resources, _run_config, _start_resources
 from . import a11y
 from .glasses_server import GlassesServer
 from .voice import VoiceRecorder, transcribe as transcribe_voice
@@ -505,9 +505,13 @@ class MainFrame(wx.Frame):
         # the step can be approved first. returns the agent's reply, or None if
         # the user denied a step.
         workflow, config = self._workflow, self._config
+        if workflow is None or config is None:
+            raise RuntimeError('The agent has not been started.')
         self._logged_decision = None
         self._full_answer = ''
-        payload = {'query': query, 'messages': [{'role': 'user', 'content': query}]}
+        payload: PipelineState | None = {
+            'query': query, 'messages': [{'role': 'user', 'content': query}],
+        }
         while True:
             async for chunk in workflow.astream(
                 payload, config, stream_mode='updates', interrupt_before=['execute']
@@ -526,7 +530,7 @@ class MainFrame(wx.Frame):
     async def _end_task(self, note: str):
         # close out a task that stopped part-way the same way node_resolve does,
         # so the next prompt starts clean but the chat memory is kept
-        if self._workflow is None:
+        if self._workflow is None or self._config is None:
             return
         try:
             await self._workflow.aupdate_state(
@@ -579,14 +583,17 @@ class MainFrame(wx.Frame):
             self._log(f'  Check:   Not doing that. {reason.removeprefix("gate rejected: ")}')
         elif node == 'execute':
             result = update.get('last_result')
-            if getattr(result, 'error', None):
-                self._log(f'  Problem: {result.error}')
+            error = getattr(result, 'error', None)
+            if error:
+                self._log(f'  Problem: {error}')
             if update.get('done'):
                 self._full_answer = str(getattr(result, 'extracted_content', '') or '')
 
     async def _current_page(self) -> tuple[str, str]:
+        session = self._browser_session
+        if session is None:
+            return '', ''
         try:
-            session = self._browser_session
             return await session.get_current_page_url(), await session.get_current_page_title()
         except Exception:
             return '', ''
