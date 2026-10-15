@@ -34,6 +34,20 @@ DEFAULT_SETTINGS = {
 }
 
 
+# what the agent is doing, in the status bar's first field:
+#   Ready    on, and doing nothing
+#   Running  working on a task
+#   Done     finished the task successfully; back to Ready after a moment
+#   Stopped  waiting for the user to decide (an approval, or what to do with a
+#            glasses prompt); back to Running if it carries on, Ready if not
+#   Error    reported a failure; back to Running if it carries on (a failed
+#            step it retries), Ready once the task has ended
+READY, RUNNING, DONE, STOPPED, ERROR = 'Ready', 'Running', 'Done', 'Stopped', 'Error'
+
+# how long Done or Error stays up after a task ends, before going back to Ready
+STATUS_HOLD_MS = 5000
+
+
 def load_settings():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
@@ -353,7 +367,7 @@ class MainFrame(wx.Frame):
 
         self.status_bar = self.CreateStatusBar(2)
         self.status_bar.SetStatusWidths([-1, 180])
-        self._show_status('Ready')
+        self._show_status(READY)
         self._show_status('Glasses: off', 1)
 
         self.prompt.Bind(wx.EVT_KEY_DOWN, self._on_prompt_key_down)
@@ -401,6 +415,25 @@ class MainFrame(wx.Frame):
             f'Status: {self.status_bar.GetStatusText(0)}, {self.status_bar.GetStatusText(1)}',
         )
 
+    def _finish_status(self, status: str):
+        # Done or Error when a task ends, then Ready after a moment, unless a new
+        # task has started by then. safe to call from any thread
+        def show():
+            self._show_status(status)
+            wx.CallLater(STATUS_HOLD_MS, back_to_ready)
+
+        def back_to_ready():
+            if not self._agent_busy() and self.status_bar.GetStatusText(0) == status:
+                self._show_status(READY)
+
+        wx.CallAfter(show)
+
+    async def _last_status(self) -> str | None:
+        # how the agent says the last turn ended (PipelineState.status)
+        if self._workflow is None or self._config is None:
+            return None
+        return (await self._workflow.aget_state(self._config)).values.get('status')
+
     def _announce_run_finished(self):
         # the outcome is spoken by _log(speak=True). focus stays where it is,
         # because moving it would cut that speech off; the log's cursor is left
@@ -437,7 +470,7 @@ class MainFrame(wx.Frame):
             self._log(f'Task: {task}')
 
         wx.CallAfter(a11y.announce, 'Agent started.')
-        self._set_status('Running…')
+        self._set_status(RUNNING)
         self.run_btn.Disable()
         self.new_task_btn.Disable()
 
@@ -460,21 +493,24 @@ class MainFrame(wx.Frame):
             query = await self._add_photo_context(task, glasses_item)
             answer = await self._run_turn(query)
             if answer is None:
+                # the user denied a step, so the agent stopped waiting and ended
                 error = 'A step was denied on the computer, so the agent stopped.'
                 self._log('[Stopped] Permission denied by user.', speak=True)
-                self._set_status('Stopped')
+                self._set_status(READY)
             else:
                 # the agent stores the full answer; the screen reader and the
-                # phone (which reads it aloud) get the short form
+                # phone (which reads it aloud) get the short form. any ending
+                # but ok (gave up, step limit, a failure) is an Error
+                succeeded = await self._last_status() == 'ok'
                 result = compact_glasses_reply(query, answer)
-                self._log(f'\n[Done] {result}', speak=True)
+                self._log(f'\n[{DONE if succeeded else ERROR}] {result}', speak=True)
                 if len(answer.strip()) > len(result):
                     self._log(f'Full answer: {answer.strip()}')
-                self._set_status('Done')
+                self._finish_status(DONE if succeeded else ERROR)
         except Exception as e:
             error = str(e)
             self._log(f'[Error] {e}', speak=True)
-            self._set_status('Error')
+            self._finish_status(ERROR)
             await self._end_task(f'Stopped by an error: {e}')
         finally:
             if reply is not None:
@@ -554,7 +590,7 @@ class MainFrame(wx.Frame):
         self._browser_session = None
         self._prev_domain = ''
         self.log.Clear()
-        self._set_status('Ready')
+        self._set_status(READY)
 
         if session is not None:
             asyncio.run_coroutine_threadsafe(session.kill(), self._loop)
@@ -565,6 +601,7 @@ class MainFrame(wx.Frame):
     async def _log_update(self, node: str, update: dict):
         # one graph node just finished; `update` is what it wrote to the state
         if node == 'plan':
+            self._set_status(RUNNING)
             decision = update['last_decision']
             url, title = await self._current_page()
             description = await self._describe_decision(decision)
@@ -584,6 +621,7 @@ class MainFrame(wx.Frame):
             error = getattr(result, 'error', None)
             if error:
                 self._log(f'  Problem: {error}')
+                self._set_status(ERROR)  # back to Running when it plans again
 
     async def _current_page(self) -> tuple[str, str]:
         session = self._browser_session
@@ -615,11 +653,13 @@ class MainFrame(wx.Frame):
             text = self._format_permission_description(
                 decision.reasoning, description, url, title
             )
+            self._set_status(STOPPED)
             await asyncio.get_running_loop().run_in_executor(
                 None, self._block_for_permission, text
             )
             if not self._permission_approved:
-                return False
+                return False  # the run ends, and _run_agent_async sets Ready
+            self._set_status(RUNNING)
 
         self._prev_domain = _domain(going_to)
         return True
@@ -709,9 +749,15 @@ class MainFrame(wx.Frame):
 
         dlg = GlassesDataDialog(self, item)
         a11y.bring_to_front()
+        self._show_status(STOPPED)
         dlg.ShowModal()
         choice = dlg.choice
         dlg.Destroy()
+        if self._agent_busy():
+            # a task was started while this dialog was open
+            self._show_status(RUNNING)
+        elif choice != GlassesDataDialog.ACT:
+            self._show_status(READY)  # acting starts a run, which sets Running
 
         if choice == GlassesDataDialog.ACT:
             if self._agent_busy():
@@ -751,14 +797,14 @@ class MainFrame(wx.Frame):
             self._log(f'[Voice] Failed to start recording: {e}', speak=True)
             self.voice_btn.SetValue(False)
             return
+        # the button and the spoken log say what voice input is doing; the
+        # status bar's first field is only for the agent
         self.voice_btn.SetLabel('Recording… (click to stop)')
-        self._set_status('Recording voice input…')
         self._log('[Voice] Recording started.', speak=True)
 
     def _stop_voice_recording(self):
         self.voice_btn.SetLabel('Voice Input')
         self.voice_btn.Disable()
-        self._set_status('Transcribing…')
         self._log('[Voice] Recording stopped, transcribing…', speak=True)
         threading.Thread(target=self._transcribe_recording, daemon=True).start()
 
@@ -777,7 +823,6 @@ class MainFrame(wx.Frame):
         except Exception as e:
             self._log(f'[Voice] Transcription failed: {e}', speak=True)
         finally:
-            self._set_status('Ready')
             wx.CallAfter(self.voice_btn.Enable)
 
     def _apply_transcript(self, text: str):

@@ -56,9 +56,20 @@ this launches the main window (`gui/main.py:AgentApp`).
   current plan, and the action(s) it's taking (navigating, clicking, typing,
   scrolling, extracting page content, etc.). if the agent's own check turns
   a step down, the log says why and the agent plans again.
-- a run ends with the agent's reply; when the reply was shortened for
-  speaking aloud, the full answer is shown underneath.
-- status bar shows `ready` / `running…` / `done` / `stopped` / `error`.
+- a run ends with the agent's reply, logged as `[Done]` if the agent finished
+  the task and `[Error]` if it didn't (gave up, ran out of steps, or failed);
+  when the reply was shortened for speaking aloud, the full answer is shown
+  underneath.
+- the status bar's first field says what the agent is doing:
+  - **ready**: on, and doing nothing.
+  - **running**: working on a task.
+  - **done**: finished the task successfully; back to ready after 5 seconds.
+  - **stopped**: waiting for you to decide (an approval, or what to do with a
+    glasses prompt); back to running if the agent carries on, ready if not.
+  - **error**: the agent reported a failure; back to running if it carries on
+    (a failed step it retries), ready after 5 seconds once the task has ended.
+- voice input shows its state on the voice button and in the spoken log, not
+  in the status bar.
 
 ### permission prompts
 - before the agent acts in the browser, a dialog can pop up describing
