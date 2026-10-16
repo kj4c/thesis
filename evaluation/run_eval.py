@@ -12,7 +12,8 @@
 #   summary.csv   the same per task, with a `success` column to score. a task
 #                 that didn't end with status ok is filled in as 0 already,
 #                 except status blocked (the site showed a captcha, checkpoint
-#                 or sign-in wall): left blank, to re-run rather than score
+#                 or sign-in wall): left blank, to re-run rather than score;
+#                 and a gave_up with the agent's own answer: left blank, to review
 #   screenshots/  per task: the page the planner read at each step (stepNN.png)
 #                 and the page at the end (final.png). both of WebVoyager's
 #                 scoring methods judge from these
@@ -317,6 +318,33 @@ def _describe(node: str, update: dict | None) -> dict:
         {"message": update["messages"][-1]["content"]} if update.get("messages") else {})
 
 
+# ── scoring ──────────────────────────────────────────────────────────────────
+# gave_up covers two endings. a loop guard or an unbuildable action stops the
+# task with one of these stock messages: no answer, a failure. otherwise the
+# planner stopped itself with its own answer, which can be right: "no product
+# meets the conditions", backed by the screenshots, is the correct answer when
+# a reference has gone stale (Amazon--6). those are reviewed like ok answers
+_STOCK_STOPS = {nodes.STUCK_MESSAGE, nodes.BAD_ACTION_MESSAGE}
+
+
+def _needs_review(status: str | None, answer: str | None) -> bool:
+    if status == "gave_up":
+        text = (answer or "").strip()
+        return bool(text) and text not in _STOCK_STOPS
+    return status in ("ok", "blocked")
+
+
+def _notes(r: dict) -> str:
+    if r["status"] == "blocked":
+        first = r["blocked"][0]
+        return f"blocked by the site ({first['kind']} at step {first['step']}): re-run, don't score"
+    if r["status"] == "gave_up":
+        if _needs_review(r["status"], r["answer"]):
+            return "gave up with its own answer: review it (it can be right, e.g. nothing meets the conditions)"
+        return "status gave_up: stopped with a stock message, no answer"
+    return "" if r["status"] == "ok" else f"status {r['status']}: no answer"
+
+
 # ── one task ─────────────────────────────────────────────────────────────────
 async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
     calls: list = []
@@ -395,9 +423,9 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
         "reference_type": task["reference_type"],
         "answer": answer, "status": status, "error": error, "setup_error": setup_error,
         "blocked": blocks or None,
-        # anything else that isn't ok (step limit, timeout, failure) ended
-        # without an answer: a failure, as in WebVoyager. ok answers still need judging
-        "success": None if status in ("ok", "blocked") else 0,
+        # anything else (step limit, timeout, failure, a loop-guard stop) ended
+        # without an answer: a failure, as in WebVoyager. answers still need judging
+        "success": None if _needs_review(status, answer) else 0,
         "steps": state["steps"], "seconds": round(time.perf_counter() - start, 1),
         **_tally(calls),
     }
@@ -493,14 +521,7 @@ async def main():
         writer = csv.writer(f)
         writer.writerow(columns + ["success", "notes"])
         for r in results:
-            if r["status"] == "blocked":
-                first = r["blocked"][0]
-                notes = f"blocked by the site ({first['kind']} at step {first['step']}): re-run, don't score"
-            elif r["status"] == "ok":
-                notes = ""
-            else:
-                notes = f"status {r['status']}: no answer"
-            writer.writerow([r[c] for c in columns] + ["" if r["success"] is None else r["success"], notes])
+            writer.writerow([r[c] for c in columns] + ["" if r["success"] is None else r["success"], _notes(r)])
 
     costs = [r["cost_usd"] for r in results if r["cost_usd"] is not None]
     print(f"\n{len(results)} runs | statuses: "

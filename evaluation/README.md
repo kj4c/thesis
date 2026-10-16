@@ -26,8 +26,14 @@ success is judged by a person, as in WebVoyager's human evaluation: look at
 the task's screenshots, supplemented by the agent's step log, and decide
 whether it did what the task asked. record it in the run's `summary.csv`.
 
-- **already scored**: a task that didn't end with status `ok` (gave up, step
-  limit, timeout, failure) has `success` 0. only the rest need reviewing.
+- **already scored**: a task that didn't end with an answer (step limit,
+  timeout, failure, or a loop guard stopping it with "Sorry, I got stuck…")
+  has `success` 0. only the rest need reviewing.
+- **gave up with its own answer**: a `gave_up` where the agent wrote its own
+  answer is left blank, to review like an `ok` one. it can be right: when no
+  product meets the task's conditions any more, "none of them qualify", backed
+  by screenshots, is the correct answer (see Amazon below). it's a 0 if the
+  screenshots show it just didn't manage the task.
 - **blocked**: a task with status `blocked` hit a captcha, checkpoint or
   sign-in wall and didn't finish (see below). its `success` is left blank: don't
   score it, re-run it. the end of a run prints the `--ids` to re-run.
