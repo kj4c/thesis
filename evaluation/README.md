@@ -13,6 +13,7 @@ the baseline and every later comparison.
 ```bash
 python evaluation/run_eval.py --label baseline
 python evaluation/run_eval.py --ids "Google Search--40,Amazon--0" --label smoke
+python evaluation/run_eval.py --ids "Amazon--6" --amazon-gap 120 --label rerun
 ```
 
 evaluation always runs with `PRICE_TUNING=false`; the other settings come from
@@ -27,6 +28,9 @@ whether it did what the task asked. record it in the run's `summary.csv`.
 
 - **already scored**: a task that didn't end with status `ok` (gave up, step
   limit, timeout, failure) has `success` 0. only the rest need reviewing.
+- **blocked**: a task with status `blocked` hit a captcha, checkpoint or
+  sign-in wall and didn't finish (see below). its `success` is left blank: don't
+  score it, re-run it. the end of a run prints the `--ids` to re-run.
 - **where to look**: `screenshots/<task>_r<repeat>/` (`stepNN.png` is the page
   the planner read at step NN, `final.png` the page at the end) and that
   task's lines in `steps.jsonl` (each step's action, reasoning and outcome).
@@ -38,11 +42,16 @@ whether it did what the task asked. record it in the run's `summary.csv`.
 - **Google Search**: the answer has to agree with the golden reference. if the
   fact has changed since the reference was written ("the latest…") and the
   screenshots show the current one, accept it and say so in `notes`.
-- **Amazon**: judge whether the answer meets the task's conditions on the
-  store the agent was sent to (see the redirect note below), not whether it
-  matches the reference product. price ranges are read in the store's own
-  currency ("$100 to $200" means A$100–200 on amazon.com.au), which is also
-  what the agent is told to do.
+- **Amazon**: judge whether the answer meets the task's conditions on
+  amazon.com as the screenshots show it (US delivery address, prices in USD),
+  not whether it matches the reference product. Amazon's references are only
+  "possible" answers and many have gone stale: listings, prices and review
+  counts have changed since 2023. if no product meets the conditions any more,
+  an answer that says so, backed by screenshots (e.g. a filtered list sorted by
+  review count), is a 1; naming a product that doesn't meet them is a 0. say
+  the reference is stale in `notes`. (e.g. Amazon--6: the reference stroller
+  had 22,146 reviews; in October 2026 it has about 5.8K, and no black stroller
+  at $100–200 has over 20,000.)
 - **notes**: one line on why, for every 0 and for any judgement call.
 
 if two people are available, have both score the same few runs independently
@@ -51,17 +60,34 @@ defend.
 
 ## differences from WebVoyager's own runs
 
-- **Amazon redirects to amazon.com.au.** runs are made from Australia, and
-  Amazon sends the browser to its Australian store: prices are in AUD and the
-  listings differ from the US ones the reference answers came from. we accept
-  this rather than use a VPN. Amazon's references are only "possible" answers
-  anyway, so an Amazon answer is judged on whether it meets the task's
-  conditions (colour, rating, price range…) on the store the agent was sent
-  to, not on matching the reference product. WebVoyager's own reference file
-  notes that Amazon results depend on time and location.
+- **Amazon gets a US delivery address.** runs are made from Australia, and a
+  fresh browser gets its delivery country from the IP: amazon.com then shows
+  AUD prices with international shipping, hides US-only details such as FREE
+  Returns (Amazon--16's golden answer), and sometimes redirects to
+  amazon.com.au. so before each Amazon task the runner sets the delivery ZIP
+  to 10001 (New York) through amazon.com's own "Deliver to" popup, retrying up
+  to 3 times. the agent starts on a page already priced for the US. if it
+  still fails, the task runs with the IP's region and the reason is in that
+  task's `setup_error`. this is not a VPN: the IP is still Australian, so
+  anything Amazon decides by IP rather than delivery address can still differ.
+  WebVoyager's own reference file notes that Amazon results depend on time
+  and location.
+- **sites that block the browser are re-run, not scored.** before every plan
+  step, and on the final page, the runner checks for Amazon's "Continue
+  shopping" checkpoint, captcha and sign-in wall, and Google's captcha page.
+  each hit is listed in the task's `blocked` field (step, kind, URL). a task
+  that hits one and doesn't finish gets status `blocked`; one that finishes
+  anyway keeps `ok` and is scored as usual. WebVoyager also leaves out tasks
+  that were stopped by captchas or sign-in. the runner only labels these
+  tasks: a blocked task still runs to its step limit.
+- **a gap between Amazon tasks.** Amazon flags a burst of fresh, cookie-less
+  sessions from one IP as bots, and a flagged session stays blocked for the
+  whole task. an Amazon task waits until 90 s after the previous one ended
+  (`--amazon-gap` to change it, recorded in `config.json`). avoid quick test
+  runs just before a scored one.
 - **a subset**: 29 of the 643 tasks, on two sites (see `make_subset.py`).
-- **windowed, not headless**: same 1024x768 page area, but headless chrome is
-  met with more bot checks and captchas.
+- **windowed, not headless**: same 1024x768 page area, but Google sends
+  headless chrome to its captcha page on every search (tested October 2026).
 - **a 600 s cap per task** on top of the 15-step limit, which WebVoyager
   doesn't have.
 
