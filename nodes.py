@@ -506,6 +506,14 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
             )
             return Command(goto="execute", update={"last_decision": stop})
 
+    # a done with no text has no answer to give: execute would report the word
+    # "done". send it back so the planner writes the answer (or why it stopped).
+    # no verifier call needed. a second empty done trips the loop guard above
+    if decision.action == "done" and not (decision.text or "").strip():
+        print("  analyse [✗] done: no answer text")
+        return _reject(state, rej_key, "done has no text: put the answer to the request "
+                       "(or why you couldn't finish) in text")
+
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
     dom_text = summary.dom_state.llm_representation()[:6000]
@@ -534,7 +542,11 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
 
     if approved:
         return Command(goto="execute")
+    return _reject(state, rej_key, reason)
 
+
+def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal["plan", "resolve"]]:
+    # send a rejected action back to the planner with the reason in scratch
     entry = {"action": rej_key, "outcome": f"gate rejected: {reason}"}
     scratch = state.get("scratch", []) + [entry]
     # a rejection loops back to plan without passing resolve, which is what
