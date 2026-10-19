@@ -41,6 +41,14 @@ python run.py
 
 this launches the main window (`gui/main.py:AgentApp`).
 
+## running the tests
+
+```bash
+pip install pytest pytest-asyncio
+pytest                      # offline: fake models + fake browser, ~1s
+RUN_LIVE=1 pytest -m live   # real browser; the last test also uses your api keys
+```
+
 ## features
 
 ### task input and agent runs

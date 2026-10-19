@@ -168,14 +168,21 @@ async def cleanup_background(app: web.Application):
     await app["session"].kill()
 
 
-def main():
-    port = int(os.environ.get("GLASSES_PORT", DEFAULT_PORT))
-    app = web.Application()
+def create_app(port: int) -> web.Application:
+    # photos arrive base64-encoded in the json body; aiohttp's default 1mb cap
+    # would turn a full-size glasses photo into an "invalid json" error
+    app = web.Application(client_max_size=20 * 1024 ** 2)
     app["port"] = port
     app.router.add_get("/health", handle_health)
     app.router.add_post("/data", handle_data)
     app.on_startup.append(start_background)
     app.on_cleanup.append(cleanup_background)
+    return app
+
+
+def main():
+    port = int(os.environ.get("GLASSES_PORT", DEFAULT_PORT))
+    app = create_app(port)
     # 0.0.0.0 so the glasses (on the same lan) can reach it, not just localhost
     print(f"[glasses] listening on http://0.0.0.0:{port}  "
           f"(/health, POST /data)")
