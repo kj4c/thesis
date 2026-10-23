@@ -14,7 +14,7 @@ requires Python 3.14 (see `.venv/pyvenv.cfg`).
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate
-pip install browser-use langgraph wxPython aiohttp zeroconf sounddevice numpy google-genai python-dotenv
+pip install browser-use langgraph wxPython aiohttp zeroconf sounddevice numpy google-genai python-dotenv google-api-python-client google-auth-httplib2 google-auth-oauthlib keyring cryptography
 playwright install chromium   # browser-use drives a real Chromium instance
 ```
 
@@ -109,6 +109,34 @@ RUN_LIVE=1 pytest -m live   # real browser; the last test also uses your api key
 - settings → smart glasses shows the lan and mdns addresses to point the
   glasses app at, lets you change the listening port, and toggle
   auto-start on launch.
+
+### add an event from a glasses photo
+- Ask the glasses app to capture the event poster and say something explicit
+  such as **“Add this event to my calendar.”** The same `/data` server delivers
+  the photo and prompt to the GUI.
+- The app reads the title, date, time, and location, then opens an editable
+  review dialog. It adds nothing to Google Calendar until you select **Add to
+  Calendar**. If a date or time is unclear, fill it in before confirming.
+- Connect your account in **Settings → Calendar → Choose… → Connect Google Account**.
+  Google sign-in opens in your default browser, and you grant the app permission
+  there. The app never asks for your Google password or an API key.
+- One-time app setup requires an OAuth Desktop client configuration:
+  1. In Google Cloud Console, create or select a project and enable the Google
+     Calendar API.
+  2. Configure OAuth consent for your Google account and create an OAuth
+     client with application type **Desktop app**. For a project in testing
+     mode, add your Google account as a test user.
+  3. Download the client JSON, then select it in Settings. This file identifies
+     the app to Google; each user still connects their own account in the browser.
+- The connection record is stored in a local SQLite database under the user's
+  application-support directory. OAuth credentials are encrypted in that
+  database with a key kept in the operating system credential store. Disconnect
+  in Settings to revoke Google access and remove the saved local connection.
+- The app requests event access to the signed-in account's primary calendar.
+  Google's desktop OAuth flow requires an OAuth client ID; desktop apps are
+  public clients, so the downloaded client configuration is not an account
+  password or a private API key. Public release may require Google OAuth
+  verification for the requested user-data scope.
 
 ### settings
 opened via the **settings** button; three tabs:
