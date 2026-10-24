@@ -13,6 +13,12 @@ from browser_use.filesystem.file_system import FileSystem
 # own iteration limit (--max_iter 15 in its run.sh), so evaluation runs compare
 MAX_STEPS = 15
 
+# how long browser-use waits before reading a page, in seconds. its defaults
+# (0.25 s minimum, 0.5 s for network idle) are too short for an Amazon product
+# page: in the 16 Oct baseline the agent read two of them blank right after the
+# click and wasted a step (suggestions #11). this slows every step a little
+PAGE_LOAD_WAITS = {"minimum_wait_page_load_time": 1.0, "wait_for_network_idle_page_load_time": 2.0}
+
 
 class PipelineState(TypedDict, total=False):
     # the current user turn (latest natural language input). Required: every
@@ -66,10 +72,13 @@ async def _start_resources(**browser_options: Any) -> tuple[BrowserSession, Tool
     # newer playwright chromium ("Google Chrome for Testing.app"), and a fixed
     # browser keeps evaluation runs comparable. unset = browser_use's own search
     # browser_options go straight to BrowserSession (evaluation fixes the window
-    # size with them); the gui and mvp.py pass none and get browser_use's defaults
+    # size with them); the gui and mvp.py pass none and get browser_use's
+    # defaults, apart from the page-load waits, which every caller gets
     browser_path = os.getenv("BROWSER_PATH")
     if browser_path:
         browser_options["executable_path"] = browser_path
+    for option, seconds in PAGE_LOAD_WAITS.items():
+        browser_options.setdefault(option, seconds)
     session = BrowserSession(keep_alive=True, **browser_options)
     await session.start()
     tools = Tools()

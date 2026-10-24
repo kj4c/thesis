@@ -37,6 +37,12 @@ whether it did what the task asked. record it in the run's `summary.csv`.
 - **blocked**: a task with status `blocked` hit a captcha, checkpoint or
   sign-in wall and didn't finish (see below). its `success` is left blank: don't
   score it, re-run it. the end of a run prints the `--ids` to re-run.
+- **setup failed**: a task with status `setup_failed` never reached the agent:
+  opening its site (or setting Amazon's ZIP) raised first, usually a page-load
+  timeout. the error is in `setup_error`. like `blocked`, its `success` is left
+  blank and it's in the `--ids` to re-run. (before 23 Oct these were recorded
+  as `harness_timeout` after about 33 s with 0 steps, e.g. Amazon--12 in
+  `baseline_first`.)
 - **where to look**: `screenshots/<task>_r<repeat>/` (`stepNN.png` is the page
   the planner read at step NN, `final.png` the page at the end) and that
   task's lines in `steps.jsonl` (each step's action, reasoning and outcome).
@@ -58,6 +64,18 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   the reference is stale in `notes`. (e.g. Amazon--6: the reference stroller
   had 22,146 reviews; in October 2026 it has about 5.8K, and no black stroller
   at $100–200 has over 20,000.)
+- **content that needs a sign-in**: the agent never signs in, so part of a
+  page can be out of reach (e.g. Amazon's full reviews: "Sign in to see
+  customer reviews"). if the agent correctly says that a sign-in is what
+  stopped it, and gives the closest answer the page allows instead, that is a
+  1. e.g. Amazon--12: the full top review needs a sign-in, so the review
+  snippet the page shows counts, and so does the ratings count standing in for
+  the number of reviews. it's a 0 if the screenshots show the content was
+  there without signing in, or if the answer leaves out what the sign-in hid
+  without saying so. this is different from **blocked** (below): a captcha,
+  checkpoint or sign-in wall that covers the whole site because Amazon or
+  Google took the browser for a bot. those are re-run, not scored. say which
+  in `notes`.
 - **notes**: one line on why, for every 0 and for any judgement call.
 
 if two people are available, have both score the same few runs independently

@@ -12,7 +12,8 @@
 #   summary.csv   the same per task, with a `success` column to score. a task
 #                 that didn't end with status ok is filled in as 0 already,
 #                 except status blocked (the site showed a captcha, checkpoint
-#                 or sign-in wall): left blank, to re-run rather than score;
+#                 or sign-in wall) and setup_failed (opening the site raised
+#                 before the agent started): left blank, to re-run rather than score;
 #                 and a gave_up with the agent's own answer: left blank, to review
 #   screenshots/  per task: the page the planner read at each step (stepNN.png)
 #                 and the page at the end (final.png). both of WebVoyager's
@@ -50,7 +51,7 @@ import llm
 import nodes
 from graph import build_agent
 from mvp import last_assistant_reply
-from state import MAX_STEPS, PipelineState, _resources, _run_config, _start_resources
+from state import MAX_STEPS, PAGE_LOAD_WAITS, PipelineState, _resources, _run_config, _start_resources
 
 TASKS = Path(__file__).parent / "tasks.jsonl"
 RESULTS = Path(__file__).parent / "results"
@@ -331,13 +332,15 @@ def _needs_review(status: str | None, answer: str | None) -> bool:
     if status == "gave_up":
         text = (answer or "").strip()
         return bool(text) and text not in _STOCK_STOPS
-    return status in ("ok", "blocked")
+    return status in ("ok", "blocked", "setup_failed")
 
 
 def _notes(r: dict) -> str:
     if r["status"] == "blocked":
         first = r["blocked"][0]
         return f"blocked by the site ({first['kind']} at step {first['step']}): re-run, don't score"
+    if r["status"] == "setup_failed":
+        return f"setup failed before the agent started ({r['setup_error']}): re-run, don't score"
     if r["status"] == "gave_up":
         if _needs_review(r["status"], r["answer"]):
             return "gave up with its own answer: review it (it can be right, e.g. nothing meets the conditions)"
@@ -346,6 +349,11 @@ def _notes(r: dict) -> str:
 
 
 # ── one task ─────────────────────────────────────────────────────────────────
+class _SetupFailed(Exception):
+    # opening the task's site (or setting Amazon's ZIP) raised before the agent ran
+    pass
+
+
 async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
     calls: list = []
     token = _usage.set(calls)
@@ -374,11 +382,19 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
         state["last"] = now
 
     try:
-        await session.navigate_to(task["web"])
-        if task["web_name"] == "Amazon":
-            setup_error = await _set_us_delivery(session, task["web"])
-            if setup_error:
-                print(f"  ({setup_error}; running with the IP's region)")
+        # setup is caught on its own: a page-load timeout here (navigate_to
+        # gives up after about 30 s) is a TimeoutError too, and used to be
+        # recorded as the 600 s task cap. the agent never started, so it's
+        # setup_failed, re-run rather than scored
+        try:
+            await session.navigate_to(task["web"])
+            if task["web_name"] == "Amazon":
+                setup_error = await _set_us_delivery(session, task["web"])
+                if setup_error:
+                    print(f"  ({setup_error}; running with the IP's region)")
+        except Exception as e:
+            setup_error = repr(e)
+            raise _SetupFailed from e
         workflow = build_agent()
         config = _run_config(session, tools, file_system, f"{task['id']}#{repeat}")
         query = PROMPT.format(ques=task["ques"], web=task["web"])
@@ -389,11 +405,22 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
                 for node, update in chunk.items():
                     record(node, update)
 
-        await asyncio.wait_for(drive(), TASK_TIMEOUT)
-        status = (await workflow.aget_state(config)).values.get("status")
-        answer = last_assistant_reply(workflow, config)
-    except asyncio.TimeoutError:
-        status = "harness_timeout"
+        # only the cap expiring is a harness_timeout. a TimeoutError raised
+        # inside the agent is a harness_error like any other exception
+        cap = asyncio.timeout(TASK_TIMEOUT)
+        try:
+            async with cap:
+                await drive()
+        except TimeoutError:
+            if not cap.expired():
+                raise
+            status = "harness_timeout"
+        else:
+            status = (await workflow.aget_state(config)).values.get("status")
+            answer = last_assistant_reply(workflow, config)
+    except _SetupFailed:
+        status = "setup_failed"
+        print(f"  (setup failed: {setup_error}; re-run it)")
     except Exception as e:
         status, error = "harness_error", repr(e)
     finally:
@@ -457,7 +484,7 @@ def _config(args, tasks: list) -> dict:
         "extraction": [llm.EXTRACTION_PROVIDER, llm.EXTRACTION_MODEL],
         "price_tuning": llm.PRICE_TUNING, "max_steps": MAX_STEPS, "task_timeout": TASK_TIMEOUT,
         "amazon_us_zip": US_ZIP, "amazon_gap": args.amazon_gap,
-        "browser_path": os.getenv("BROWSER_PATH"), "browser": BROWSER, "prices_usd_per_mtok": PRICES,
+        "browser_path": os.getenv("BROWSER_PATH"), "browser": BROWSER, "page_load_waits": PAGE_LOAD_WAITS, "prices_usd_per_mtok": PRICES,
         "python": platform.python_version(),
         "packages": {p: version(p) for p in ("browser-use", "langgraph", "langchain-core", "pydantic")},
     }
@@ -527,9 +554,9 @@ async def main():
     print(f"\n{len(results)} runs | statuses: "
           f"{ {s: sum(r['status'] == s for r in results) for s in {r['status'] for r in results}} } | "
           f"total ${sum(costs):.2f} | results in {out.relative_to(ROOT)}")
-    blocked = sorted({r["task_id"] for r in results if r["status"] == "blocked"})
-    if blocked:
-        print(f"blocked by the site, re-run with: --ids \"{','.join(blocked)}\"")
+    rerun = sorted({r["task_id"] for r in results if r["status"] in ("blocked", "setup_failed")})
+    if rerun:
+        print(f"blocked by the site or setup failed, re-run with: --ids \"{','.join(rerun)}\"")
 
 
 if __name__ == "__main__":

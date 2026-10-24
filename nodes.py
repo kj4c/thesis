@@ -2,6 +2,7 @@
 # and prompts they use.
 
 from typing import Literal, Any
+import hashlib
 import re
 
 from pydantic import BaseModel, Field, field_validator
@@ -151,6 +152,35 @@ _PRICE_PLANNER_RULES = (
     "- If actions-taken already shows an extract with a $ price, choose done immediately.\n\n"
 ) if PRICE_TUNING else "- done: set `text` to the final answer/result for the user.\n\n"
 
+# how the planner answers a FIND / WHAT IS query from Google. the glasses demo
+# (PRICE_TUNING) reads the results page and stops, for speed. otherwise Google's
+# own summaries are only a hint: the AI Overview is another model's unsourced
+# text, and a result snippet is a cut-off piece of a page, and the 16 Oct
+# baseline passed on mistakes from both (suggestions #11, question 11). a BLV
+# user can't easily check them, so the answer is confirmed on a source page
+_ANSWERING_RULES = (
+    "ANSWERING 'FIND / WHAT IS' QUERIES EFFICIENTLY: after the Google search loads, "
+    "the answer is usually right there — in the AI Overview box or the shopping/"
+    "result snippets. Use `extract` to read it, then `done`. Do NOT click through "
+    "into individual shops or scroll repeatedly unless the answer truly isn't on "
+    "the results page. (Clicking into a store is only needed to DO something there, "
+    "like add to cart — not just to read a price.)\n\n"
+) if PRICE_TUNING else (
+    "ANSWERING 'FIND / WHAT IS' QUERIES: Google's own summaries are HINTS, not "
+    "answers. The AI Overview is written by another AI without sources and can be "
+    "wrong; a result snippet is a cut-off excerpt of a page and can be incomplete "
+    "or out of context. Before choosing done on a fact from either, CHECK it "
+    "against a real source: click (or navigate to) the result that should contain "
+    "it — an official site, Wikipedia, or a reputable source — and `extract` the "
+    "fact from that page. One source page that confirms the fact is enough. If the "
+    "source page disagrees with the Overview or snippet, trust the source page and "
+    "say they disagree. If no source page can be opened, you may answer from the "
+    "summary, but say so in the answer (e.g. 'from Google's AI Overview, not "
+    "confirmed on a source page'). Always name the site the answer came from. "
+    "Never fill gaps from your own knowledge: every fact in the answer must come "
+    "from a page you read.\n\n"
+)
+
 PLANNER_SYSTEM = SystemMessage(content=(
     "You are the planner for a browser automation agent. Each turn you get the "
     "user's task and the current page's interactive elements, each tagged with a "
@@ -171,12 +201,7 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "navigate DIRECTLY to a Google search URL in one step: "
     "https://www.google.com/search?q=<your+query+with+plus+signs>. Don't go to "
     "google.com and type — just navigate straight to the search URL.\n\n"
-    "ANSWERING 'FIND / WHAT IS' QUERIES EFFICIENTLY: after the Google search loads, "
-    "the answer is usually right there — in the AI Overview box or the shopping/"
-    "result snippets. Use `extract` to read it, then `done`. Do NOT click through "
-    "into individual shops or scroll repeatedly unless the answer truly isn't on "
-    "the results page. (Clicking into a store is only needed to DO something there, "
-    "like add to cart — not just to read a price.)\n\n"
+    + _ANSWERING_RULES +
     "Only navigate to a url the user gave you or a well-known site — NEVER invent a "
     "shop/product url. If a navigation FAILS (can't resolve), don't retry it — go "
     "to a Google search URL instead.\n\n"
@@ -230,7 +255,10 @@ _VERIFIER_FIND_RULE = (
     "  • FIND / ANSWER task (e.g. 'find the cheapest spoon', 'what's the price'): "
     "APPROVE if the requested information is present on the current page or already "
     "stated in the done text. No click or committing action is required — reading "
-    "the page IS the completion.\n"
+    "the page IS the completion. EXCEPTION: if the answer rests ONLY on Google's AI "
+    "Overview or a search-result snippet (no source page was opened or extracted in "
+    "the actions-taken list), REJECT and say to confirm it on a source page — "
+    "unless the done text itself says it wasn't confirmed on a source page.\n"
 )
 
 VERIFIER_SYSTEM = SystemMessage(content=(
@@ -464,6 +492,14 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
         return Command(goto="execute")
 
     rej_key = f"(rejected: {decision.action} idx={decision.index} url={decision.url})"
+    # a done's index and url are always None, so without its answer every done
+    # gets the same key and the guard below throws away a corrected answer as a
+    # "repeat". a short hash of the text tells answers apart; a second empty
+    # done still matches the first and stops
+    answer_text = (decision.text or "").strip()
+    if decision.action == "done" and answer_text:
+        digest = hashlib.sha1(answer_text.encode()).hexdigest()[:8]
+        rej_key = f"(rejected: done answer={digest})"
 
     # rejection loop guard: if this exact action was already rejected AND nothing
     # has actually executed since, the planner is ignoring the feedback and
@@ -545,7 +581,9 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     return _reject(state, rej_key, reason)
 
 
-def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal["plan", "resolve"]]:
+# typed like node_analyse's return: Command's type parameter is invariant, so a
+# narrower Literal here doesn't type-check where analyse returns it
+def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal["execute", "plan", "resolve"]]:
     # send a rejected action back to the planner with the reason in scratch
     entry = {"action": rej_key, "outcome": f"gate rejected: {reason}"}
     scratch = state.get("scratch", []) + [entry]
