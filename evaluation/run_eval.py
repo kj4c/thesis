@@ -413,7 +413,7 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
     session = None  # stays None if the browser fails to start
     start = time.perf_counter()
     state = {"last": start, "seen": 0, "errors_seen": 0, "steps": 0}
-    status, answer, error, setup_error = None, None, None, None
+    status, answer, error, setup_error, setup_seconds = None, None, None, None, None
 
     def record(node: str, update: dict | None):
         now = time.perf_counter()
@@ -451,6 +451,11 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         except Exception as e:
             setup_error = repr(e)
             raise _SetupFailed from e
+        # the first node's seconds start here, not at browser start: they
+        # used to include opening the site and Amazon's ZIP, which read as a
+        # slow respond (up to 50 s on Amazon). the task's total still counts setup
+        state["last"] = time.perf_counter()
+        setup_seconds = round(state["last"] - start, 1)
         workflow = build_agent()
         config = _run_config(session, tools, file_system, f"{task['id']}#{repeat}.{attempt}")
         query = PROMPT.format(ques=task["ques"], web=task["web"])
@@ -516,6 +521,7 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         # without an answer: a failure, as in WebVoyager. answers still need judging
         "success": None if _needs_review(status, answer) else 0,
         "steps": state["steps"], "seconds": round(time.perf_counter() - start, 1),
+        "setup_seconds": setup_seconds,
         **_tally(calls),
     }
 
