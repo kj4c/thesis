@@ -81,6 +81,7 @@ async def default_error_handler(state: PipelineState, error: NodeError) -> Comma
     return Command(goto=END, update={
         "messages": [{"role": "assistant", "content": message}],
         "status": status,
+        "last_error": f"{error.node}: {error.error!r}"[:500],
         "step": 0,
         "done": False,
         "scratch": [],

@@ -49,8 +49,13 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   failed even after its own retries, not that the agent decided wrongly. like
   `blocked`, it's retried, and if it still fails it's left blank, not scored.
   (before 24 Oct these were scored 0, e.g. Amazon--33 in `baseline_bugfix_first`.)
+- **a step timed out**: `timed_out` means one step hit its 30 s limit: a slow
+  model API, or a browser tab that stopped answering (Amazon--0 in the 24 Oct
+  smoke run). the error is in `error`. it's retried and, if it times out again,
+  left blank like the others. different from `harness_timeout`, the 600 s cap
+  on the whole task, which is a 0: the agent was still going.
 - **retries**: after the planned tasks, every task that ended `blocked`,
-  `setup_failed`, `llm_failed` or `rate_limited` is run once more, Amazon gap
+  `setup_failed`, `llm_failed`, `rate_limited` or `timed_out` is run once more, Amazon gap
   included (`--retries N` for more, `--retries 0` for none). `tasks.jsonl` keeps
   every attempt, with an `attempt` field (0 is the planned run); `summary.csv`
   has the last attempt only, and its `notes` say when a task was retried. a

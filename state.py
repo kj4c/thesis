@@ -61,6 +61,10 @@ class PipelineState(TypedDict, total=False):
     # gave_up: the agent stopped itself without completing the task (done with
     # success=False, from the planner or a loop guard)
     status: str
+    # the error behind a failure status, set by graph.default_error_handler, so
+    # logs can tell an overloaded API from bad model output. not cleared on a
+    # later success: read it only alongside a failure status
+    last_error: str
     '''
     TODO:
     properties that update as it progresses based on current node plan
@@ -94,22 +98,32 @@ async def _start_resources(**browser_options: Any) -> tuple[BrowserSession, Tool
     return session, tools, file_system
 
 
+async def _page_state(session: BrowserSession) -> tuple[str, str]:
+    page = await session.must_get_current_page()
+    protocol, ready_state = (await page.evaluate(_PAGE_READY_JS)).split()
+    return protocol, ready_state
+
+
 async def _wait_for_page(session: BrowserSession) -> None:
     # wait until the current tab has finished loading (see PAGE_READY_TIMEOUT).
     # returns at once on a page that's already loaded, so most steps cost one
-    # quick check
+    # quick check. each check is itself cut off at the time left: a tab that
+    # stops answering (Amazon--0 in the 24 Oct smoke run) would otherwise hold
+    # the check, and the node, until the node's own 30 s timeout
     start = time.monotonic()
     while True:
+        left = PAGE_READY_TIMEOUT - (time.monotonic() - start)
+        if left <= 0:
+            return
         try:
-            page = await session.must_get_current_page()
-            protocol, ready_state = (await page.evaluate(_PAGE_READY_JS)).split()
+            protocol, ready_state = await asyncio.wait_for(_page_state(session), left)
             web = protocol in ("http:", "https:")
             if ready_state == "complete" and (web or time.monotonic() - start >= ABOUT_BLANK_GRACE):
                 return
+        except TimeoutError:
+            return  # the tab isn't answering: read it as it is
         except Exception:
             pass  # mid-navigation, or the new tab isn't attached yet
-        if time.monotonic() - start >= PAGE_READY_TIMEOUT:
-            return
         await asyncio.sleep(0.25)
 
 

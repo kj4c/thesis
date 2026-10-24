@@ -4,6 +4,7 @@
 from typing import Literal, Any
 import hashlib
 import re
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 from langgraph.graph import END
@@ -172,7 +173,11 @@ _ANSWERING_RULES = (
     "or out of context. Before choosing done on a fact from either, CHECK it "
     "against a real source: click (or navigate to) the result that should contain "
     "it — an official site, Wikipedia, or a reputable source — and `extract` the "
-    "fact from that page. One source page that confirms the fact is enough. If the "
+    "fact from that page. One source page that confirms the fact is enough. A source "
+    "chip, citation or preview card inside Google's answer is NOT the source page: "
+    "clicking one may only open a preview on Google. Before naming a site as your "
+    "source, check the current page (and the 'now on' site after your click) is "
+    "that site, not google.com; if you're still on Google, open the result itself. If the "
     "source page disagrees with the Overview or snippet, trust the source page and "
     "say they disagree. If no source page can be opened, you may answer from the "
     "summary, but say so in the answer (e.g. 'from Google's AI Overview, not "
@@ -258,7 +263,11 @@ _VERIFIER_FIND_RULE = (
     "the page IS the completion. EXCEPTION: if the answer rests ONLY on Google's AI "
     "Overview or a search-result snippet (no source page was opened or extracted in "
     "the actions-taken list), REJECT and say to confirm it on a source page — "
-    "unless the done text itself says it wasn't confirmed on a source page.\n"
+    "unless the done text itself says it wasn't confirmed on a source page. A "
+    "click on a source chip or preview inside Google's answer doesn't count: if the "
+    "done text names a site as its source but the agent never left Google (the "
+    "current page is google.com and no click or navigate in the actions-taken list "
+    "is 'now on' another site), REJECT and say to open that site's page.\n"
 )
 
 VERIFIER_SYSTEM = SystemMessage(content=(
@@ -295,7 +304,11 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "(e.g. an 'Add to bag' click). Do NOT require a visible confirmation — those are "
     "transient and often gone by now. Do NOT send the agent on a cart-verification "
     "detour.\n"
-    "  REJECT done only if neither holds; then say what's still needed.\n\n"
+    "  • SIGN-IN: the agent never signs in. If the content the task needs is behind "
+    "a sign-in (e.g. Amazon's 'Sign in to see customer reviews', shown on the page or "
+    "in an extract), and the done text says so and gives the closest answer the page "
+    "allows, APPROVE. Do NOT send the agent looking for a way around the sign-in.\n"
+    "  REJECT done only if none of these holds; then say what's still needed.\n\n"
     "When rejecting, give one concrete next step."
 ))
 
@@ -363,9 +376,26 @@ def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
 
 # how much of an action's outcome the planner sees in the actions-taken list.
 # extract gets more: its outcome IS the information the task asked for, and a
-# cut-off answer makes the planner extract again or fill in from memory
+# cut-off answer makes the planner extract again or fill in from memory. 1000
+# was too short: 16 of 24 extracts in the 24 Oct run hit it, and Google
+# Search--24 lost Proxima d to the cut (suggestions #11). so the latest extract
+# is shown up to EXTRACT_OUTCOME_LIMIT, and older ones, already acted on, are
+# cut back to OLDER_EXTRACT_LIMIT so a long task's prompt doesn't keep growing
 OUTCOME_LIMIT = 200
-EXTRACT_OUTCOME_LIMIT = 1000
+EXTRACT_OUTCOME_LIMIT = 4000
+OLDER_EXTRACT_LIMIT = 1000
+CUT_MARK = " […cut off]"
+
+
+def _cut(text: str, limit: int) -> str:
+    # shorten to limit, saying so: an unmarked cut reads like the whole page
+    # (Google Search--24 had to guess its extract was cut)
+    return text if len(text) <= limit else text[:limit] + CUT_MARK
+
+
+def _is_extract(entry: dict) -> bool:
+    action = entry.get("action")
+    return isinstance(action, dict) and "extract" in action
 
 
 def _extract_answer(content: str) -> str:
@@ -393,8 +423,16 @@ def _format_scratch(scratch: list[dict], limit: int = 10) -> str:
     if not scratch:
         return "Actions taken so far this task: (none yet — this is the first step)\n\n"
     recent = scratch[-limit:]
+    latest_extract = next((e for e in reversed(recent) if _is_extract(e)), None)
+
+    def outcome(e: dict) -> str:
+        text = str(e["outcome"])
+        if _is_extract(e) and e is not latest_extract and not text.endswith(CUT_MARK):
+            return _cut(text, OLDER_EXTRACT_LIMIT)
+        return text
+
     lines = "\n".join(
-        f"{i}. {e['action']} -> {e['outcome']}" for i, e in enumerate(recent, 1)
+        f"{i}. {e['action']} -> {outcome(e)}" for i, e in enumerate(recent, 1)
     )
     return (
         f"Actions you have ALREADY taken this task (do not repeat them; if these "
@@ -653,13 +691,20 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
     # jot this action down in the within-task log so the next plan step sees it
     # read the page fresh so the outcome reflects where the action landed us
     after = await session.get_browser_state_summary(include_screenshot=False)
+    landed = ""
     if result.error:
         outcome, limit = result.error, OUTCOME_LIMIT
     elif action_name == "extract" and result.extracted_content:
         outcome, limit = _extract_answer(result.extracted_content), EXTRACT_OUTCOME_LIMIT
     else:
         outcome, limit = result.extracted_content or f"now on {after.url}", OUTCOME_LIMIT
-    entry = {"action": action_dump, "outcome": str(outcome)[:limit]}
+        if action_name == "click" and result.extracted_content:
+            # say which site the click landed on: "Clicked a 'MacRumors'" alone
+            # doesn't show whether it opened the page or only a preview on Google
+            # (Google Search--7, 24 Oct smoke run). the host is short, so it goes
+            # after the cut and always survives it
+            landed = f" -> now on {urlparse(after.url).netloc or after.url}"
+    entry = {"action": action_dump, "outcome": _cut(str(outcome), limit - len(landed)) + landed}
     scratch = state.get("scratch", []) + [entry]
     return {"last_result": result, "done": done, "scratch": scratch}
 

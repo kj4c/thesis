@@ -7,9 +7,14 @@
 # writes evaluation/results/<time>_<label>/:
 #   config.json   the setup the run used (models, flags, git commit, versions)
 #   steps.jsonl   one line per graph node: what it decided or did, how long it
-#                 took, and the tokens and cost of the model calls inside it
+#                 took, and the tokens and cost of the model calls inside it.
+#                 llm_errors lists any model call in it that raised, even one
+#                 a retry then recovered; the error handler's line has the
+#                 failure in last_error
 #   tasks.jsonl   one line per attempt at a task: answer, status, steps, time,
-#                 tokens, cost. attempt 0 is the planned run, 1+ are retries
+#                 tokens, cost, the error behind a failure status (error) and
+#                 every failed model call (llm_errors). attempt 0 is the
+#                 planned run, 1+ are retries
 #   summary.csv   the same per task (its last attempt), with a `success`
 #                 column to score. a task that didn't end with status ok is
 #                 filled in as 0 already, except: an ending in RETRY_STATUSES
@@ -182,11 +187,13 @@ async def _try_set_zip(page) -> str | None:
 # wall. an Amazon task waits until this long after the last one ended
 AMAZON_GAP = 90
 
-# endings that say nothing about the agent: the site blocked the browser, setup
-# failed before the agent started, or the model API failed or hit its limit.
+# endings that say nothing about the agent's decisions: the site blocked the
+# browser, setup failed before the agent started, the model API failed or hit
+# its limit, or a step hit its 30 s node timeout (a slow API, or a browser tab
+# that stopped answering, as in Amazon--0 in the 24 Oct smoke run).
 # after the planned tasks, each one that ended like this is run again (--retries
 # times at most), last so Amazon has had longest to forget the session
-RETRY_STATUSES = ("blocked", "setup_failed", "llm_failed", "rate_limited")
+RETRY_STATUSES = ("blocked", "setup_failed", "llm_failed", "rate_limited", "timed_out")
 
 # pages that mean the site blocked the browser rather than the agent failing:
 # a task that hits one and doesn't finish is marked blocked, to re-run, not
@@ -204,13 +211,21 @@ _BLOCK_JS = """() => {
 }"""
 
 
+# how long the runner's own checks on the browser (block check, final
+# screenshot, closing it) may take. a tab that stops answering held each of
+# them indefinitely: 70 s at the end of Amazon--0 in the 24 Oct smoke run
+BROWSER_CHECK_TIMEOUT = 10
+
+
 async def _block(session) -> dict | None:
-    try:
+    async def check():
         page = await session.must_get_current_page()
         kind = await page.evaluate(_BLOCK_JS)
         return {"kind": kind, "url": await page.evaluate("() => location.href")} if kind else None
+    try:
+        return await asyncio.wait_for(check(), BROWSER_CHECK_TIMEOUT)
     except Exception:
-        return None  # mid-load, or no page: not evidence of a block
+        return None  # mid-load, no page, or not answering: not evidence of a block
 
 
 # WebVoyager's own wording (WebVoyager-main/run.py)
@@ -228,6 +243,9 @@ PRICES = {
 # including the extraction model browser-use calls inside `extract`. wrap their
 # ainvoke so each call's usage lands in the current task's list
 _usage: ContextVar[list | None] = ContextVar("usage", default=None)
+# failed calls, including ones a retry then recovered: an API error (overload,
+# rate limit) shows up here even when the task carried on, as a slow node
+_llm_errors: ContextVar[list | None] = ContextVar("llm_errors", default=None)
 
 
 def _recording(build):
@@ -236,7 +254,13 @@ def _recording(build):
         original = chat.ainvoke
 
         async def ainvoke(messages, output_format=None, **kwargs):
-            response = await original(messages, output_format=output_format, **kwargs)
+            try:
+                response = await original(messages, output_format=output_format, **kwargs)
+            except Exception as e:
+                errors = _llm_errors.get()
+                if errors is not None:
+                    errors.append(f"{model}: {e!r}"[:300])
+                raise
             log = _usage.get()
             if log is not None and response.usage is not None:
                 log.append((model, response.usage))
@@ -293,7 +317,9 @@ async def _plan_with_screenshot(state, config):
             blocks.append({"step": state.get("step", 0) + 1, **block})
     if folder is not None:
         try:
-            await session.take_screenshot(path=str(folder / f"step{state.get('step', 0) + 1:02d}.png"))
+            await asyncio.wait_for(
+                session.take_screenshot(path=str(folder / f"step{state.get('step', 0) + 1:02d}.png")),
+                BROWSER_CHECK_TIMEOUT)
         except Exception as e:
             print(f"  (screenshot failed: {e!r})")
     return await _node_plan(state, config)
@@ -323,7 +349,7 @@ def _describe(node: str, update: dict | None) -> dict:
         return {"action": entry.get("action"), "outcome": entry.get("outcome"),
                 "error": getattr(result, "error", None), "done": update.get("done")}
     # resolve and the error handler: how the task ended, if it did
-    return {k: update[k] for k in ("status",) if k in update} | (
+    return {k: update[k] for k in ("status", "last_error") if k in update} | (
         {"message": update["messages"][-1]["content"]} if update.get("messages") else {})
 
 
@@ -358,6 +384,8 @@ def _ending_note(r: dict) -> str:
         return f"setup failed before the agent started ({r['setup_error']}): re-run, don't score"
     if r["status"] in ("llm_failed", "rate_limited"):
         return f"the model API failed ({r['status']}), not the agent: re-run, don't score"
+    if r["status"] == "timed_out":
+        return f"a step timed out ({r['error']}), not the agent's decision: re-run, don't score"
     if r["status"] == "gave_up":
         if _needs_review(r["status"], r["answer"]):
             return "gave up with its own answer: review it (it can be right, e.g. nothing meets the conditions)"
@@ -380,9 +408,11 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
     shots_token = _screenshots.set(shots)
     blocks: list = []
     blocks_token = _blocks.set(blocks)
+    llm_errors: list = []
+    llm_errors_token = _llm_errors.set(llm_errors)
     session = None  # stays None if the browser fails to start
     start = time.perf_counter()
-    state = {"last": start, "seen": 0, "steps": 0}
+    state = {"last": start, "seen": 0, "errors_seen": 0, "steps": 0}
     status, answer, error, setup_error = None, None, None, None
 
     def record(node: str, update: dict | None):
@@ -390,6 +420,9 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         new = calls[state["seen"]:]
         state["seen"] = len(calls)
         info = _describe(node, update)
+        if len(llm_errors) > state["errors_seen"]:
+            info["llm_errors"] = llm_errors[state["errors_seen"]:]
+            state["errors_seen"] = len(llm_errors)
         state["steps"] = max(state["steps"], info.get("step") or 0)
         steps_file.write(json.dumps({
             "task_id": task["id"], "repeat": repeat, "attempt": attempt, "node": node,
@@ -439,7 +472,9 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
                 raise
             status = "harness_timeout"
         else:
-            status = (await workflow.aget_state(config)).values.get("status")
+            values = (await workflow.aget_state(config)).values
+            status = values.get("status")
+            error = values.get("last_error")  # fresh thread: only set by a failure
             answer = last_assistant_reply(workflow, config)
     except _SetupFailed:
         status = "setup_failed"
@@ -450,16 +485,18 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         _usage.reset(token)
         _screenshots.reset(shots_token)
         _blocks.reset(blocks_token)
+        _llm_errors.reset(llm_errors_token)
         if session is not None:
             block = await _block(session)
             if block:
                 blocks.append({"step": "final", **block})
             try:
-                await session.take_screenshot(path=str(shots / "final.png"))
+                await asyncio.wait_for(session.take_screenshot(path=str(shots / "final.png")),
+                                       BROWSER_CHECK_TIMEOUT)
             except Exception as e:
                 print(f"  (final screenshot failed: {e!r})")
             try:
-                await session.kill()
+                await asyncio.wait_for(session.kill(), BROWSER_CHECK_TIMEOUT)
             except Exception:
                 pass
 
@@ -473,6 +510,7 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         "ques": task["ques"], "reference": task["reference"],
         "reference_type": task["reference_type"],
         "answer": answer, "status": status, "error": error, "setup_error": setup_error,
+        "llm_errors": llm_errors or None,
         "blocked": blocks or None,
         # anything else (step limit, timeout, failure, a loop-guard stop) ended
         # without an answer: a failure, as in WebVoyager. answers still need judging
