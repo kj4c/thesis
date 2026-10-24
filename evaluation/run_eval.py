@@ -8,13 +8,15 @@
 #   config.json   the setup the run used (models, flags, git commit, versions)
 #   steps.jsonl   one line per graph node: what it decided or did, how long it
 #                 took, and the tokens and cost of the model calls inside it
-#   tasks.jsonl   one line per task: answer, status, steps, time, tokens, cost
-#   summary.csv   the same per task, with a `success` column to score. a task
-#                 that didn't end with status ok is filled in as 0 already,
-#                 except status blocked (the site showed a captcha, checkpoint
-#                 or sign-in wall) and setup_failed (opening the site raised
-#                 before the agent started): left blank, to re-run rather than score;
-#                 and a gave_up with the agent's own answer: left blank, to review
+#   tasks.jsonl   one line per attempt at a task: answer, status, steps, time,
+#                 tokens, cost. attempt 0 is the planned run, 1+ are retries
+#   summary.csv   the same per task (its last attempt), with a `success`
+#                 column to score. a task that didn't end with status ok is
+#                 filled in as 0 already, except: an ending in RETRY_STATUSES
+#                 (the site blocked the browser, setup failed, or the model API
+#                 failed) that is still there after the retries, left blank to
+#                 re-run rather than score; and a gave_up with the agent's own
+#                 answer, left blank to review
 #   screenshots/  per task: the page the planner read at each step (stepNN.png)
 #                 and the page at the end (final.png). both of WebVoyager's
 #                 scoring methods judge from these
@@ -51,7 +53,7 @@ import llm
 import nodes
 from graph import build_agent
 from mvp import last_assistant_reply
-from state import MAX_STEPS, PAGE_LOAD_WAITS, PipelineState, _resources, _run_config, _start_resources
+from state import ABOUT_BLANK_GRACE, MAX_STEPS, PAGE_READY_TIMEOUT, PipelineState, _resources, _run_config, _start_resources
 
 TASKS = Path(__file__).parent / "tasks.jsonl"
 RESULTS = Path(__file__).parent / "results"
@@ -179,6 +181,12 @@ async def _try_set_zip(page) -> str | None:
 # them gets the next one a "Continue shopping" checkpoint and then a sign-in
 # wall. an Amazon task waits until this long after the last one ended
 AMAZON_GAP = 90
+
+# endings that say nothing about the agent: the site blocked the browser, setup
+# failed before the agent started, or the model API failed or hit its limit.
+# after the planned tasks, each one that ended like this is run again (--retries
+# times at most), last so Amazon has had longest to forget the session
+RETRY_STATUSES = ("blocked", "setup_failed", "llm_failed", "rate_limited")
 
 # pages that mean the site blocked the browser rather than the agent failing:
 # a task that hits one and doesn't finish is marked blocked, to re-run, not
@@ -332,15 +340,24 @@ def _needs_review(status: str | None, answer: str | None) -> bool:
     if status == "gave_up":
         text = (answer or "").strip()
         return bool(text) and text not in _STOCK_STOPS
-    return status in ("ok", "blocked", "setup_failed")
+    return status == "ok" or status in RETRY_STATUSES
 
 
 def _notes(r: dict) -> str:
+    note = _ending_note(r)
+    if r["attempt"]:
+        note = f"retry {r['attempt']}, earlier attempts in tasks.jsonl. {note}".strip()
+    return note
+
+
+def _ending_note(r: dict) -> str:
     if r["status"] == "blocked":
         first = r["blocked"][0]
         return f"blocked by the site ({first['kind']} at step {first['step']}): re-run, don't score"
     if r["status"] == "setup_failed":
         return f"setup failed before the agent started ({r['setup_error']}): re-run, don't score"
+    if r["status"] in ("llm_failed", "rate_limited"):
+        return f"the model API failed ({r['status']}), not the agent: re-run, don't score"
     if r["status"] == "gave_up":
         if _needs_review(r["status"], r["answer"]):
             return "gave up with its own answer: review it (it can be right, e.g. nothing meets the conditions)"
@@ -354,15 +371,16 @@ class _SetupFailed(Exception):
     pass
 
 
-async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
+async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path) -> dict:
     calls: list = []
     token = _usage.set(calls)
-    shots = out / "screenshots" / f"{task['id'].replace(' ', '_')}_r{repeat}"
+    shots = out / "screenshots" / (f"{task['id'].replace(' ', '_')}_r{repeat}"
+                                   + (f"_a{attempt}" if attempt else ""))
     shots.mkdir(parents=True)
     shots_token = _screenshots.set(shots)
     blocks: list = []
     blocks_token = _blocks.set(blocks)
-    session, tools, file_system = await _start_resources(**BROWSER)
+    session = None  # stays None if the browser fails to start
     start = time.perf_counter()
     state = {"last": start, "seen": 0, "steps": 0}
     status, answer, error, setup_error = None, None, None, None
@@ -374,7 +392,7 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
         info = _describe(node, update)
         state["steps"] = max(state["steps"], info.get("step") or 0)
         steps_file.write(json.dumps({
-            "task_id": task["id"], "repeat": repeat, "node": node,
+            "task_id": task["id"], "repeat": repeat, "attempt": attempt, "node": node,
             "t": round(now - start, 2), "seconds": round(now - state["last"], 2),
             **info, **_tally(new),
         }, default=str) + "\n")
@@ -385,8 +403,13 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
         # setup is caught on its own: a page-load timeout here (navigate_to
         # gives up after about 30 s) is a TimeoutError too, and used to be
         # recorded as the 600 s task cap. the agent never started, so it's
-        # setup_failed, re-run rather than scored
+        # setup_failed, re-run rather than scored. that includes the browser
+        # failing to start, which used to crash the whole run
         try:
+            session, tools, file_system = await _start_resources(**BROWSER)
+            # time the task from a running browser, as before
+            start = time.perf_counter()
+            state["last"] = start
             await session.navigate_to(task["web"])
             if task["web_name"] == "Amazon":
                 setup_error = await _set_us_delivery(session, task["web"])
@@ -396,7 +419,7 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
             setup_error = repr(e)
             raise _SetupFailed from e
         workflow = build_agent()
-        config = _run_config(session, tools, file_system, f"{task['id']}#{repeat}")
+        config = _run_config(session, tools, file_system, f"{task['id']}#{repeat}.{attempt}")
         query = PROMPT.format(ques=task["ques"], web=task["web"])
         payload: PipelineState = {"query": query, "messages": [{"role": "user", "content": query}]}
 
@@ -427,17 +450,18 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
         _usage.reset(token)
         _screenshots.reset(shots_token)
         _blocks.reset(blocks_token)
-        block = await _block(session)
-        if block:
-            blocks.append({"step": "final", **block})
-        try:
-            await session.take_screenshot(path=str(shots / "final.png"))
-        except Exception as e:
-            print(f"  (final screenshot failed: {e!r})")
-        try:
-            await session.kill()
-        except Exception:
-            pass
+        if session is not None:
+            block = await _block(session)
+            if block:
+                blocks.append({"step": "final", **block})
+            try:
+                await session.take_screenshot(path=str(shots / "final.png"))
+            except Exception as e:
+                print(f"  (final screenshot failed: {e!r})")
+            try:
+                await session.kill()
+            except Exception:
+                pass
 
     # a task the site blocked that then didn't finish says nothing about the
     # agent: it's marked to re-run, not scored. one that finished anyway keeps
@@ -445,7 +469,7 @@ async def run_task(task: dict, repeat: int, steps_file, out: Path) -> dict:
     if blocks and status != "ok":
         status = "blocked"
     return {
-        "task_id": task["id"], "repeat": repeat, "web_name": task["web_name"],
+        "task_id": task["id"], "repeat": repeat, "attempt": attempt, "web_name": task["web_name"],
         "ques": task["ques"], "reference": task["reference"],
         "reference_type": task["reference_type"],
         "answer": answer, "status": status, "error": error, "setup_error": setup_error,
@@ -476,7 +500,8 @@ def _config(args, tasks: list) -> dict:
         "label": args.label, "started": datetime.now().isoformat(timespec="seconds"),
         "git_commit": _git("rev-parse", "HEAD"),
         "git_dirty": bool(_git("status", "--porcelain", "--", "*.py", "gui")),
-        "task_ids": [t["id"] for t in tasks], "repeats": args.repeats,
+        "task_ids": [t["id"] for t in tasks], "repeats": args.repeats, "retries": args.retries,
+        "retry_statuses": RETRY_STATUSES,
         "tasks_sha256": hashlib.sha256(TASKS.read_bytes()).hexdigest(),
         "planner": [llm.PLANNER_PROVIDER, llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER)],
         "claude_effort": os.getenv("CLAUDE_EFFORT", "medium"),
@@ -484,7 +509,7 @@ def _config(args, tasks: list) -> dict:
         "extraction": [llm.EXTRACTION_PROVIDER, llm.EXTRACTION_MODEL],
         "price_tuning": llm.PRICE_TUNING, "max_steps": MAX_STEPS, "task_timeout": TASK_TIMEOUT,
         "amazon_us_zip": US_ZIP, "amazon_gap": args.amazon_gap,
-        "browser_path": os.getenv("BROWSER_PATH"), "browser": BROWSER, "page_load_waits": PAGE_LOAD_WAITS, "prices_usd_per_mtok": PRICES,
+        "browser_path": os.getenv("BROWSER_PATH"), "browser": BROWSER, "page_ready": {"timeout": PAGE_READY_TIMEOUT, "about_blank_grace": ABOUT_BLANK_GRACE}, "prices_usd_per_mtok": PRICES,
         "python": platform.python_version(),
         "packages": {p: version(p) for p in ("browser-use", "langgraph", "langchain-core", "pydantic")},
     }
@@ -496,6 +521,9 @@ async def main():
     parser.add_argument("--ids", help="comma-separated task ids (default: all)")
     parser.add_argument("--limit", type=int, help="only the first N tasks")
     parser.add_argument("--repeats", type=int, default=1, help="runs per task")
+    parser.add_argument("--retries", type=int, default=1,
+                        help=f"times to re-run a task that ended {'/'.join(RETRY_STATUSES)}, "
+                             "after the planned tasks (0 = never)")
     parser.add_argument("--amazon-gap", type=float, default=AMAZON_GAP,
                         help="seconds between the end of one Amazon task and the start of the next")
     args = parser.parse_args()
@@ -517,32 +545,50 @@ async def main():
     if config["git_dirty"]:
         print("warning: uncommitted code changes; this run can't be traced to a commit")
 
-    results = []
+    attempts = []  # every attempt, in the order run
+    latest = {}  # (task id, repeat) -> its last attempt: what summary.csv scores
     amazon_ended = None  # when the last Amazon task finished
     with open(out / "steps.jsonl", "w") as steps_file, open(out / "tasks.jsonl", "w") as tasks_file:
+
+        async def attempt_task(task, repeat, attempt, label):
+            nonlocal amazon_ended
+            print(f"\n=== {label} {task['id']} (repeat {repeat}"
+                  + (f", retry {attempt})" if attempt else ")") + " ===")
+            amazon = task["web_name"] == "Amazon"
+            if amazon and amazon_ended is not None:
+                wait = args.amazon_gap - (time.monotonic() - amazon_ended)
+                if wait > 0:
+                    print(f"  (waiting {wait:.0f}s since the last Amazon task)")
+                    await asyncio.sleep(wait)
+            result = await run_task(task, repeat, attempt, steps_file, out)
+            if amazon:
+                amazon_ended = time.monotonic()
+            attempts.append(result)
+            latest[(task["id"], repeat)] = result
+            tasks_file.write(json.dumps(result, default=str) + "\n")
+            tasks_file.flush()
+            for b in result["blocked"] or []:
+                print(f"  (blocked at step {b['step']}: {b['kind']}, {b['url'][:80]})")
+            print(f"=== {result['status']} | {result['steps']} steps | {result['seconds']}s | "
+                  f"${result['cost_usd']} | answer: {str(result['answer'])[:100]}")
+
         total = len(tasks) * args.repeats
         for repeat in range(args.repeats):
             for task in tasks:
-                n = len(results) + 1
-                print(f"\n=== [{n}/{total}] {task['id']} (repeat {repeat}) ===")
-                amazon = task["web_name"] == "Amazon"
-                if amazon and amazon_ended is not None:
-                    wait = args.amazon_gap - (time.monotonic() - amazon_ended)
-                    if wait > 0:
-                        print(f"  (waiting {wait:.0f}s since the last Amazon task)")
-                        await asyncio.sleep(wait)
-                result = await run_task(task, repeat, steps_file, out)
-                if amazon:
-                    amazon_ended = time.monotonic()
-                results.append(result)
-                tasks_file.write(json.dumps(result, default=str) + "\n")
-                tasks_file.flush()
-                for b in result["blocked"] or []:
-                    print(f"  (blocked at step {b['step']}: {b['kind']}, {b['url'][:80]})")
-                print(f"=== {result['status']} | {result['steps']} steps | {result['seconds']}s | "
-                      f"${result['cost_usd']} | answer: {str(result['answer'])[:100]}")
+                await attempt_task(task, repeat, 0, f"[{len(attempts) + 1}/{total}]")
 
-    columns = ["task_id", "repeat", "web_name", "ques", "reference", "reference_type", "answer",
+        by_id = {t["id"]: t for t in tasks}
+        for attempt in range(1, args.retries + 1):
+            again = [key for key, r in latest.items() if r["status"] in RETRY_STATUSES]
+            if not again:
+                break
+            print(f"\n── retry {attempt}: {len(again)} task(s) ended {'/'.join(RETRY_STATUSES)} ──")
+            for i, (task_id, repeat) in enumerate(again, 1):
+                await attempt_task(by_id[task_id], repeat, attempt, f"[retry {attempt}: {i}/{len(again)}]")
+
+    results = list(latest.values())
+
+    columns = ["task_id", "repeat", "attempt", "web_name", "ques", "reference", "reference_type", "answer",
                "status", "steps", "seconds", "calls", "input_tokens", "output_tokens", "cost_usd"]
     with open(out / "summary.csv", "w", newline="") as f:
         writer = csv.writer(f)
@@ -550,13 +596,16 @@ async def main():
         for r in results:
             writer.writerow([r[c] for c in columns] + ["" if r["success"] is None else r["success"], _notes(r)])
 
-    costs = [r["cost_usd"] for r in results if r["cost_usd"] is not None]
-    print(f"\n{len(results)} runs | statuses: "
+    # cost counts every attempt, retries included: they were paid for
+    costs = [r["cost_usd"] for r in attempts if r["cost_usd"] is not None]
+    retried = len(attempts) - len(results)
+    print(f"\n{len(results)} runs, {retried} retry attempts | final statuses: "
           f"{ {s: sum(r['status'] == s for r in results) for s in {r['status'] for r in results}} } | "
           f"total ${sum(costs):.2f} | results in {out.relative_to(ROOT)}")
-    rerun = sorted({r["task_id"] for r in results if r["status"] in ("blocked", "setup_failed")})
+    rerun = sorted({r["task_id"] for r in results if r["status"] in RETRY_STATUSES})
     if rerun:
-        print(f"blocked by the site or setup failed, re-run with: --ids \"{','.join(rerun)}\"")
+        print(f"still {'/'.join(RETRY_STATUSES)} after {args.retries} retries, "
+              f"re-run with: --ids \"{','.join(rerun)}\"")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 # the shared pipeline state + the runtime resources nodes and runners both need.
 
+import asyncio
 import operator
 import os
 import tempfile
+import time
 from typing import TypedDict, Annotated, Any, Required
 
 from langchain_core.runnables import RunnableConfig
@@ -13,11 +15,20 @@ from browser_use.filesystem.file_system import FileSystem
 # own iteration limit (--max_iter 15 in its run.sh), so evaluation runs compare
 MAX_STEPS = 15
 
-# how long browser-use waits before reading a page, in seconds. its defaults
-# (0.25 s minimum, 0.5 s for network idle) are too short for an Amazon product
-# page: in the 16 Oct baseline the agent read two of them blank right after the
-# click and wasted a step (suggestions #11). this slows every step a little
-PAGE_LOAD_WAITS = {"minimum_wait_page_load_time": 1.0, "wait_for_network_idle_page_load_time": 2.0}
+# browser-use reads a page almost at once: it waits 0.3 s at most, skips a tab
+# still on about:blank, and its profile's page-load waits
+# (minimum_wait_page_load_time etc.) are never read in 0.13.1. so after a click
+# into an Amazon product page, or one that opens a new tab, the planner could
+# read a blank page and waste a step (Amazon--16 and --12 on 16 Oct; Google
+# Search--3, --7 and Amazon--36 on 24 Oct, all after a new tab). _wait_for_page
+# waits for the page to finish loading first, up to PAGE_READY_TIMEOUT seconds;
+# a page that never finishes (ads, long polling) is read anyway when time's up.
+# a new tab gets ABOUT_BLANK_GRACE seconds to leave about:blank, since the start
+# page can be about:blank too (the gui, mvp.py), and that shouldn't cost the
+# full timeout
+PAGE_READY_TIMEOUT = 6.0
+ABOUT_BLANK_GRACE = 2.0
+_PAGE_READY_JS = "() => location.protocol + ' ' + document.readyState"
 
 
 class PipelineState(TypedDict, total=False):
@@ -72,18 +83,34 @@ async def _start_resources(**browser_options: Any) -> tuple[BrowserSession, Tool
     # newer playwright chromium ("Google Chrome for Testing.app"), and a fixed
     # browser keeps evaluation runs comparable. unset = browser_use's own search
     # browser_options go straight to BrowserSession (evaluation fixes the window
-    # size with them); the gui and mvp.py pass none and get browser_use's
-    # defaults, apart from the page-load waits, which every caller gets
+    # size with them); the gui and mvp.py pass none and get browser_use's defaults
     browser_path = os.getenv("BROWSER_PATH")
     if browser_path:
         browser_options["executable_path"] = browser_path
-    for option, seconds in PAGE_LOAD_WAITS.items():
-        browser_options.setdefault(option, seconds)
     session = BrowserSession(keep_alive=True, **browser_options)
     await session.start()
     tools = Tools()
     file_system = FileSystem(tempfile.mkdtemp(prefix="mvp_fs_"))
     return session, tools, file_system
+
+
+async def _wait_for_page(session: BrowserSession) -> None:
+    # wait until the current tab has finished loading (see PAGE_READY_TIMEOUT).
+    # returns at once on a page that's already loaded, so most steps cost one
+    # quick check
+    start = time.monotonic()
+    while True:
+        try:
+            page = await session.must_get_current_page()
+            protocol, ready_state = (await page.evaluate(_PAGE_READY_JS)).split()
+            web = protocol in ("http:", "https:")
+            if ready_state == "complete" and (web or time.monotonic() - start >= ABOUT_BLANK_GRACE):
+                return
+        except Exception:
+            pass  # mid-navigation, or the new tab isn't attached yet
+        if time.monotonic() - start >= PAGE_READY_TIMEOUT:
+            return
+        await asyncio.sleep(0.25)
 
 
 def _run_config(session: BrowserSession, tools: Tools, file_system: FileSystem,

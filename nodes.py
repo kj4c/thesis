@@ -16,7 +16,7 @@ from browser_use.llm.messages import (
 )
 
 from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry, PRICE_TUNING
-from state import PipelineState, MAX_STEPS, _resources
+from state import PipelineState, MAX_STEPS, _resources, _wait_for_page
 from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
 
@@ -645,6 +645,10 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
     print(f"  exec → {action_name or action_dump}")
     if getattr(result, "error", None):
         print(f"  exec error: {result.error}")
+
+    # let a page the action opened finish loading, so neither the outcome below
+    # nor the next plan step reads it blank (see state.PAGE_READY_TIMEOUT)
+    await _wait_for_page(session)
 
     # jot this action down in the within-task log so the next plan step sees it
     # read the page fresh so the outcome reflects where the action landed us

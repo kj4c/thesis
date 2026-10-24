@@ -35,14 +35,27 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   by screenshots, is the correct answer (see Amazon below). it's a 0 if the
   screenshots show it just didn't manage the task.
 - **blocked**: a task with status `blocked` hit a captcha, checkpoint or
-  sign-in wall and didn't finish (see below). its `success` is left blank: don't
-  score it, re-run it. the end of a run prints the `--ids` to re-run.
+  sign-in wall and didn't finish (see below). the runner retries it once at
+  the end of the run (see **retries** below); if it's still blocked, its
+  `success` is left blank: don't score it, re-run it. the end of a run prints
+  the `--ids` to re-run.
 - **setup failed**: a task with status `setup_failed` never reached the agent:
-  opening its site (or setting Amazon's ZIP) raised first, usually a page-load
-  timeout. the error is in `setup_error`. like `blocked`, its `success` is left
-  blank and it's in the `--ids` to re-run. (before 23 Oct these were recorded
+  starting the browser, opening its site or setting Amazon's ZIP raised first,
+  usually a page-load timeout. the error is in `setup_error`. like `blocked`, it's retried, and if
+  it still fails its `success` is left blank and it's in the `--ids` to re-run. (before 23 Oct these were recorded
   as `harness_timeout` after about 33 s with 0 steps, e.g. Amazon--12 in
   `baseline_first`.)
+- **model API failed**: `llm_failed` or `rate_limited` means a model call
+  failed even after its own retries, not that the agent decided wrongly. like
+  `blocked`, it's retried, and if it still fails it's left blank, not scored.
+  (before 24 Oct these were scored 0, e.g. Amazon--33 in `baseline_bugfix_first`.)
+- **retries**: after the planned tasks, every task that ended `blocked`,
+  `setup_failed`, `llm_failed` or `rate_limited` is run once more, Amazon gap
+  included (`--retries N` for more, `--retries 0` for none). `tasks.jsonl` keeps
+  every attempt, with an `attempt` field (0 is the planned run); `summary.csv`
+  has the last attempt only, and its `notes` say when a task was retried. a
+  retry's screenshots are in `screenshots/<task>_r<repeat>_a<attempt>/`. the
+  run's total cost counts every attempt.
 - **where to look**: `screenshots/<task>_r<repeat>/` (`stepNN.png` is the page
   the planner read at step NN, `final.png` the page at the end) and that
   task's lines in `steps.jsonl` (each step's action, reasoning and outcome).
@@ -102,8 +115,10 @@ defend.
   each hit is listed in the task's `blocked` field (step, kind, URL). a task
   that hits one and doesn't finish gets status `blocked`; one that finishes
   anyway keeps `ok` and is scored as usual. WebVoyager also leaves out tasks
-  that were stopped by captchas or sign-in. the runner only labels these
-  tasks: a blocked task still runs to its step limit.
+  that were stopped by captchas or sign-in. a blocked task still runs to its
+  step limit, then is retried at the end of the run. it isn't stopped early:
+  tasks recover from long runs of blocks (Amazon--36 after 5 in a row,
+  Amazon--33 after 4, 24 Oct), so any early cut-off would end good tasks.
 - **a gap between Amazon tasks.** Amazon flags a burst of fresh, cookie-less
   sessions from one IP as bots, and a flagged session stays blocked for the
   whole task. an Amazon task waits until 90 s after the previous one ended
