@@ -7,6 +7,7 @@ from . import a11y
 PERMISSION_OPTIONS = [
     ('Every step', 'every_step'),
     ('When switching to a new site', 'new_site'),
+    ('Only for risky steps (buying, sending, signing in)', 'risky'),
     ('Only when an error occurs', 'on_error'),
 ]
 

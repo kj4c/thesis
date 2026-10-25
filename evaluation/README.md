@@ -80,6 +80,11 @@ whether it did what the task asked. record it in the run's `summary.csv`.
 - **Google Search**: the answer has to agree with the golden reference. if the
   fact has changed since the reference was written ("the latest…") and the
   screenshots show the current one, accept it and say so in `notes`.
+  Google Search--0 ("initial release date") is ambiguous: the 22 April 2023
+  premiere or the 5 May 2023 US release (the reference). an answer that leads
+  with the premiere but explains the difference properly is a 1, an exception
+  to the main-answer rule; it's a 0 only if the information is wrong. write
+  "ambiguous: led with the premiere" in `notes` when it does.
 - **Amazon**: judge whether the answer meets the task's conditions on
   amazon.com as the screenshots show it (US delivery address, prices in USD),
   not whether it matches the reference product. Amazon's references are only

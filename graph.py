@@ -2,6 +2,7 @@
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command, RetryPolicy, TimeoutPolicy
 # RetryPolicy's own default, but missing from langgraph.types' __all__
 from langgraph.types import default_retry_on  # pyright: ignore[reportPrivateImportUsage]
@@ -92,15 +93,17 @@ async def default_error_handler(state: PipelineState, error: NodeError) -> Comma
 '''
     the loop:
 
-        START → respond →(task)→ plan → analyse →(approved)→ execute → resolve →(loop)→ plan
-                   │                       │                                    →(done)→ END
-                   └──(answer)──→ END       └────(rejected)────→ plan
+        START → respond →(task)→ plan → analyse →(approved)→ approve →(yes)→ execute → resolve →(loop)→ plan
+                   │                       │                    │                              →(done)→ END
+                   └──(answer)──→ END       └──(rejected)→ plan  ├──(no + reason)→ plan
+                                                                 └──(stop, or no)→ END
 
     respond is the front desk: every turn it decides if the message is a task to
     run in the browser (→ plan) or a question it can answer directly (→ END).
     plan reads the page and picks an action, analyse independently verifies it
-    (so a wrong or premature action never reaches the browser), execute does it,
-    resolve loops back or finishes.
+    (so a wrong or premature action never reaches the browser), approve asks the
+    user if the approval policy calls for it (state.APPROVAL_POLICIES), execute
+    does it, resolve loops back or finishes.
 
     it's also a chat that remembers: a checkpointer + a stable thread_id means
     re-invoking with the same thread_id reloads the prior state (incl. the
@@ -122,10 +125,18 @@ def build_agent():
     )
     g.add_node("respond", nodes.node_respond)  # front desk; routes plan | END via Command
     g.add_node("plan", nodes.node_plan)
-    g.add_node("analyse", nodes.node_analyse)  # verify before acting; routes execute | plan | resolve
+    g.add_node("analyse", nodes.node_analyse)  # verify before acting; routes approve | plan | resolve
+    g.add_node("approve", nodes.node_approve)  # the user's say; routes execute | plan | resolve | END
     g.add_node("execute", nodes.node_execute, retry_policy=RetryPolicy(max_attempts=1))
     g.add_node("resolve", nodes.node_resolve)  # routes plan | END via Command
     g.add_edge(START, "respond")
     g.add_edge("plan", "analyse")
     g.add_edge("execute", "resolve")
-    return g.compile(checkpointer=InMemorySaver())
+    # pausing for approval means state is read back from the checkpoint, which
+    # holds our own types; langgraph warns that unregistered ones will be
+    # blocked in a later version, so they're listed here
+    serde = JsonPlusSerializer(allowed_msgpack_modules=[
+        ("nodes", "PlanDecision"),
+        ("browser_use.agent.views", "ActionResult"),
+    ])
+    return g.compile(checkpointer=InMemorySaver(serde=serde))

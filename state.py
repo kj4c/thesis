@@ -57,7 +57,8 @@ class PipelineState(TypedDict, total=False):
     # how the last turn ended, for the UI / logs (placeholder set).
     # set by respond/resolve on a normal finish and by
     # graph.default_error_handler on a failure:
-    #   ok | gave_up | max_steps | timed_out | rate_limited | llm_failed | execute_failed | failed
+    #   ok | gave_up | max_steps | stopped | timed_out | rate_limited | llm_failed | execute_failed | failed
+    # stopped: the user ended the task at an approval (Stop, or no without a reason)
     # gave_up: the agent stopped itself without completing the task (done with
     # success=False, from the planner or a loop guard)
     status: str
@@ -160,14 +161,28 @@ async def _bot_check(session: BrowserSession) -> str | None:
         return None
 
 
+# when nodes.node_approve asks the user before a step (§5.2.1):
+#   auto        never: evaluation runs, and serve.py until the phone can answer
+#   every_step  every step except the final answer
+#   new_site    when a step goes to a different site
+#   risky       only for steps that commit to something (buy, send, sign in, ...)
+#   on_error    when the previous step failed or the agent's own check turned it down
+APPROVAL_POLICIES = ("auto", "every_step", "new_site", "risky", "on_error")
+
+
 def _run_config(session: BrowserSession, tools: Tools, file_system: FileSystem,
-                thread_id: str) -> RunnableConfig:
+                thread_id: str, approval: str = "every_step") -> RunnableConfig:
+    # approval defaults to asking: a caller that can't answer has to say so
+    if approval not in APPROVAL_POLICIES:
+        raise ValueError(f"approval must be one of {APPROVAL_POLICIES}, not {approval!r}")
     return {
         "configurable": {
             "session": session, "tools": tools,
             "file_system": file_system, "thread_id": thread_id,
+            "approval": approval,
         },
-        # recursion_limit has to be bigger than the nodes-per-step so our own
-        # MAX_STEPS guard (not langgraph's) is what stops the loop
-        "recursion_limit": 5 * MAX_STEPS + 5,
+        # recursion_limit has to be bigger than the nodes-per-step (plan,
+        # analyse, approve, execute, resolve) so our own MAX_STEPS guard (not
+        # langgraph's) is what stops the loop
+        "recursion_limit": 6 * MAX_STEPS + 5,
     }

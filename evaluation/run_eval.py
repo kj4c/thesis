@@ -457,7 +457,10 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         state["last"] = time.perf_counter()
         setup_seconds = round(state["last"] - start, 1)
         workflow = build_agent()
-        config = _run_config(session, tools, file_system, f"{task['id']}#{repeat}.{attempt}")
+        # evaluation never waits for a person: the approve node is in the graph,
+        # as in every run, but on the auto policy
+        config = _run_config(session, tools, file_system, f"{task['id']}#{repeat}.{attempt}",
+                             approval="auto")
         query = PROMPT.format(ques=task["ques"], web=task["web"])
         payload: PipelineState = {"query": query, "messages": [{"role": "user", "content": query}]}
 
@@ -556,7 +559,7 @@ def _config(args, tasks: list) -> dict:
         "claude_effort": os.getenv("CLAUDE_EFFORT", "medium"),
         "use_vision": llm.USE_VISION, "vision": [llm.VISION_PROVIDER, llm.VISION_MODEL],
         "extraction": [llm.EXTRACTION_PROVIDER, llm.EXTRACTION_MODEL],
-        "price_tuning": llm.PRICE_TUNING, "max_steps": MAX_STEPS, "task_timeout": TASK_TIMEOUT,
+        "price_tuning": llm.PRICE_TUNING, "max_steps": MAX_STEPS, "task_timeout": TASK_TIMEOUT, "approval": "auto",
         "amazon_us_zip": US_ZIP, "amazon_gap": args.amazon_gap,
         "browser_path": os.getenv("BROWSER_PATH"), "browser": BROWSER, "page_ready": {"timeout": PAGE_READY_TIMEOUT, "about_blank_grace": ABOUT_BLANK_GRACE}, "prices_usd_per_mtok": PRICES,
         "python": platform.python_version(),

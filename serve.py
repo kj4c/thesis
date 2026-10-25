@@ -150,7 +150,10 @@ async def start_background(app: web.Application):
     session, tools, file_system = await _start_resources()
     app["session"] = session
     app["workflow"] = build_agent()
-    app["config"] = _run_config(session, tools, file_system, THREAD_ID)
+    # auto-approve for now: the phone can't answer an approval yet, and a paused
+    # graph would hold the request until the phone gave up. asking on the phone
+    # (or the glasses) is open, for the glasses teammate (suggestions #1, #9)
+    app["config"] = _run_config(session, tools, file_system, THREAD_ID, approval="auto")
     app["lock"] = asyncio.Lock()
     app["mdns"], app["mdns_info"] = await _register_mdns(app["port"])
     print(f"planner: {llm.PLANNER_PROVIDER} / "

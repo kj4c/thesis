@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 from langgraph.graph import END
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from langchain_core.runnables import RunnableConfig
 
 from browser_use import Tools, ActionResult
@@ -93,6 +93,11 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
 # would reuse browser-use's full AgentOutput schema
 class PlanDecision(BaseModel):
     reasoning: str = Field(description="one sentence: why this action moves the task forward")
+    # what the approval dialog and the GUI log show the user, instead of the
+    # model-facing reasoning (suggestions #3)
+    user_summary: str | None = Field(default=None, description="one short plain sentence for the user, who may be "
+                                     "blind: what this step does and why, e.g. 'Opening the Wikipedia page to check "
+                                     "the release date.' No element numbers, URLs or technical terms")
     action: Literal["navigate", "click", "input", "scroll", "extract", "done"]
     url: str | None = Field(default=None, description="for navigate: the URL to open")
     index: int | None = Field(default=None, description="for click/input: the [index] of the element")
@@ -139,7 +144,7 @@ class PlanDecision(BaseModel):
             return False
         return None  # anything else -> unset
 
-    @field_validator("url", "text", "answer", "source", mode="before")
+    @field_validator("url", "text", "answer", "source", "user_summary", mode="before")
     @classmethod
     def _clean_optional_str(cls, v):
         if isinstance(v, str) and v.strip().lower() in (
@@ -278,7 +283,8 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "the task is DONE — choose done. Do NOT re-click it, set a quantity, or take "
     "extra 'just to confirm' steps. A confirmation may not be visible on the page "
     "and you should NOT go looking for one.\n\n"
-    "IF YOUR LAST PROPOSAL WAS REJECTED (the actions list shows 'gate rejected: …'): "
+    "IF YOUR LAST PROPOSAL WAS REJECTED (the actions list shows 'gate rejected: …', "
+    "or 'user said no: …' when the user turned it down and said why): "
     "do NOT repeat it. Read the reason and do something DIFFERENT — e.g. if it says "
     "the item is the wrong product (forks not spoons), scroll or search for the "
     "correct product and target THAT; if it says an overlay is blocking, dismiss "
@@ -586,24 +592,24 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
         return None
 
 
-async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan", "resolve"]]:
+async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["approve", "plan", "resolve"]]:
     # verify before consequential actions (click, done). DOM is the decision;
     # vision notes overlay issues but does not block when DOM already approved —
     # otherwise a visible popup rejects a valid done answer and the agent loops.
     decision: PlanDecision = state["last_decision"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  (always set by plan)
 
     if decision.action not in ("click", "done"):
-        return Command(goto="execute")
+        return Command(goto="approve")
     # the bot-check stop comes from code, not the model: nothing to verify
     if decision.action == "done" and decision.text == BOT_CHECK_MESSAGE:
-        return Command(goto="execute")
+        return Command(goto="approve")
 
     query = state.get("query", "")
 
     # price found in done text — skip slow verifier LLM call
     if PRICE_TUNING and decision.action == "done" and price_from_text(decision.text or ""):
         print("  analyse [✓] done: price in answer")
-        return Command(goto="execute")
+        return Command(goto="approve")
 
     rej_key = f"(rejected: {decision.action} idx={decision.index} url={decision.url})"
     # a done's index and url are always None, so without its answer every done
@@ -645,7 +651,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
                     answer = compact_glasses_reply(query, raw)
                     print(f"  analyse → stop, using price {answer}")
                     stop = PlanDecision(reasoning="returning best price found", action="done", text=answer)
-                    return Command(goto="execute", update={"last_decision": stop})
+                    return Command(goto="approve", update={"last_decision": stop})
             last_reason = scratch[last_rej_idx].get("outcome", "the action was rejected repeatedly")
             print(f"  analyse → stop (same action rejected twice): {last_reason[:120]}")
             stop = PlanDecision(
@@ -654,7 +660,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
                 success=False,
                 text=STUCK_MESSAGE,
             )
-            return Command(goto="execute", update={"last_decision": stop})
+            return Command(goto="approve", update={"last_decision": stop})
 
     # a done with no text has no answer to give: execute would report the word
     # "done". send it back so the planner writes the answer (or why it stopped).
@@ -698,13 +704,13 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
         reason = f"DOM: {dom_v.reason} | VISION: {vis_v.reason}"
 
     if approved:
-        return Command(goto="execute")
+        return Command(goto="approve")
     return _reject(state, rej_key, reason)
 
 
 # typed like node_analyse's return: Command's type parameter is invariant, so a
 # narrower Literal here doesn't type-check where analyse returns it
-def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal["execute", "plan", "resolve"]]:
+def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal["approve", "plan", "resolve"]]:
     # send a rejected action back to the planner with the reason in scratch
     entry = {"action": rej_key, "outcome": f"gate rejected: {reason}"}
     scratch = state.get("scratch", []) + [entry]
@@ -715,6 +721,132 @@ def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal[
     if state.get("step", 0) >= MAX_STEPS:
         return Command(goto="resolve", update={"scratch": scratch})
     return Command(goto="plan", update={"scratch": scratch})
+
+# ── approval ─────────────────────────────────────────────────────────────────
+# the user's say before a step runs: the thesis's core requirement (§5.2.1).
+# it lives in the graph, so the gui, mvp.py and serve.py all get it, and it uses
+# interrupt() so the answer can carry a reason back in. the policy (when to
+# ask) comes from the run config: state.APPROVAL_POLICIES
+
+# said aloud when the user ends the task at an approval
+STOPPED_MESSAGE = "Okay, I've stopped. I didn't do anything more on the page."
+DENIED_MESSAGE = "Okay, I didn't do that step, and I've stopped the task."
+
+# words on a button or link that mean the step commits to something, for the
+# "risky" policy. matched against the element's visible text and labels
+RISKY_WORDS = (
+    "buy", "checkout", "check out", "pay", "place order", "order now", "purchase",
+    "add to cart", "add to basket", "add to bag", "subscribe", "submit", "send",
+    "post", "delete", "remove", "cancel order", "sign in", "log in", "login",
+    "sign up", "register", "book", "reserve", "confirm", "transfer", "donate",
+)
+
+
+async def _element_info(session, index: int | None) -> tuple[str, dict]:
+    # the visible name and attributes of the element a step acts on
+    if index is None:
+        return "", {}
+    try:
+        node = await session.get_element_by_index(index)
+    except Exception:
+        return "", {}
+    if node is None:
+        return "", {}
+    label = " ".join((node.get_meaningful_text_for_llm() or "").split())[:80]
+    return label, dict(node.attributes or {})
+
+
+def _is_risky(decision: "PlanDecision", label: str, attributes: dict) -> bool:
+    # a click or typing that commits to something; reading, scrolling and
+    # going to a page never do
+    if decision.action not in ("click", "input"):
+        return False
+    if decision.action == "input":
+        # typing a password or card details is risky whatever the field is called
+        kind = str(attributes.get("type", "")).lower()
+        autocomplete = str(attributes.get("autocomplete", "")).lower()
+        if kind == "password" or autocomplete.startswith("cc-") or "current-password" in autocomplete:
+            return True
+    words = " ".join([label, *(str(attributes.get(k, "")) for k in ("aria-label", "value", "name", "id"))]).lower()
+    return any(re.search(rf"\b{re.escape(w)}\b", words) for w in RISKY_WORDS)
+
+
+def _should_ask(policy: str, decision: "PlanDecision", state: PipelineState,
+                page_url: str, label: str, attributes: dict) -> bool:
+    if decision.action == "done" or policy == "auto":
+        return False  # done only reports the answer; nothing happens in the browser
+    if policy == "every_step":
+        return True
+    if policy == "new_site":
+        target = decision.url if decision.action == "navigate" and decision.url else page_url
+        return urlparse(target).netloc != urlparse(page_url).netloc
+    if policy == "risky":
+        return _is_risky(decision, label, attributes)
+    if policy == "on_error":
+        # the previous step was turned down by the agent's own check, or ran
+        # and came back with an error
+        scratch = state.get("scratch") or []
+        if not scratch:
+            return False
+        last = scratch[-1]
+        return str(last.get("outcome", "")).startswith("gate rejected") or bool(last.get("failed")) or bool(
+            getattr(state.get("last_result"), "error", None))
+    return True  # an unknown policy asks rather than acts
+
+
+async def node_approve(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan", "resolve", "__end__"]]:
+    # ask the user before the step runs, if the policy calls for it. the graph
+    # pauses at interrupt(); the caller resumes it with
+    # Command(resume={"decision": "yes" | "no" | "stop", "reason": optional str}).
+    # on resume the node runs again from the top and interrupt() returns that
+    decision: PlanDecision = state["last_decision"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  (always set by plan)
+    session, _, _ = _resources(config)
+    policy = (config.get("configurable") or {}).get("approval", "every_step")
+    if decision.action == "done" or policy == "auto":
+        return Command(goto="execute")
+
+    try:
+        page_url = await session.get_current_page_url()
+        page_title = await session.get_current_page_title()
+    except Exception:
+        page_url, page_title = "", ""
+    label, attributes = await _element_info(session, decision.index)
+    if not _should_ask(policy, decision, state, page_url, label, attributes):
+        return Command(goto="execute")
+
+    answer = interrupt({
+        "summary": decision.user_summary or decision.reasoning,
+        "action": decision.model_dump(exclude_none=True, exclude={"reasoning", "user_summary"}),
+        "label": label,
+        "page_url": page_url,
+        "page_title": page_title,
+        "policy": policy,
+    })
+    if not isinstance(answer, dict):
+        answer = {"decision": str(answer)}
+    choice = str(answer.get("decision", "")).lower()
+    reason = str(answer.get("reason") or "").strip()
+    print(f"  approve [{choice}]" + (f": {reason}" if reason else ""))
+
+    if choice == "yes":
+        return Command(goto="execute")
+    if choice == "no" and reason:
+        # back to the planner with the user's reason, like a rejection by the
+        # agent's own check, so it plans something different
+        entry = {"action": f"(user said no to: {decision.action} idx={decision.index} url={decision.url})",
+                 "outcome": f"user said no: {reason}"}
+        scratch = state.get("scratch", []) + [entry]
+        if state.get("step", 0) >= MAX_STEPS:
+            return Command(goto="resolve", update={"scratch": scratch})
+        return Command(goto="plan", update={"scratch": scratch})
+    # stop, a no without a reason, or anything unexpected: end the task, and
+    # reset it like resolve does so the next prompt starts clean
+    message = STOPPED_MESSAGE if choice == "stop" else DENIED_MESSAGE
+    return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
+        "messages": [{"role": "assistant", "content": message}],
+        "step": 0, "done": False, "scratch": [], "status": "stopped",
+    })
+
 
 async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
     # run the action the planner chose. just browser-use's hands 
