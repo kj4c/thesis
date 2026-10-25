@@ -533,7 +533,10 @@ class MainFrame(wx.Frame):
             # the Stop button: whatever step was running is abandoned, and the
             # task is closed out so the next prompt starts clean
             error = 'The task was stopped on the computer.'
-            self._log('[Stopped] You stopped the task.', speak=True)
+            # unlike Stop in the approval dialog, this can land mid-step, so it
+            # can't promise nothing happened on the page
+            self._log('[Stopped] You stopped the task. If a step was running, '
+                      'it may not have finished.', speak=True)
             await self._end_task('Stopped: the user stopped the task.')
             self._set_status(READY)
         except Exception as e:
@@ -735,7 +738,9 @@ class MainFrame(wx.Frame):
         # dialog has its own Stop Task button, since this one sits behind it
         if self._agent_busy() and self._agent_future is not None:
             self.stop_btn.Disable()
-            self._log('[Stopping] Stopping the task…', speak=True)
+            # logged, not spoken: the "[Stopped]" line follows straight after
+            # and would cut it off
+            self._log('[Stopping] Stopping the task…')
             self._agent_future.cancel()
 
     # glasses server
