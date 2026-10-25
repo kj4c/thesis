@@ -13,6 +13,7 @@ from browser_use import BrowserSession
 from dotenv import load_dotenv
 from glasses_vision import enrich_prompt_with_image
 from graph import build_agent
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from mvp import last_assistant_reply
 from nodes import _decision_to_action
@@ -568,12 +569,19 @@ class MainFrame(wx.Frame):
         # run one user turn through the graph. the approve node pauses it when
         # the permission setting calls for asking; the dialog's answer resumes
         # it. returns the agent's reply (also when the user stopped the task)
-        workflow, config = self._workflow, self._config
-        if workflow is None or config is None:
+        workflow, session_config = self._workflow, self._config
+        if workflow is None or session_config is None:
             raise RuntimeError('The agent has not been started.')
-        # read each turn, so a change in Settings applies to the next task
+        # read each turn, so a change in Settings applies to the next task. a copy
+        # with the setting added: same thread, so the chat memory carries over
         policy = self.settings.get('permission_frequency', 'every_step')
-        config['configurable']['approval'] = policy if policy in APPROVAL_POLICIES else 'every_step'
+        config: RunnableConfig = {
+            **session_config,
+            'configurable': {
+                **session_config.get('configurable', {}),
+                'approval': policy if policy in APPROVAL_POLICIES else 'every_step',
+            },
+        }
         self._logged_decision = None
         payload: PipelineState | Command = {
             'query': query, 'messages': [{'role': 'user', 'content': query}],
