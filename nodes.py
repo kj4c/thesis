@@ -96,16 +96,20 @@ class PlanDecision(BaseModel):
     action: Literal["navigate", "click", "input", "scroll", "extract", "done"]
     url: str | None = Field(default=None, description="for navigate: the URL to open")
     index: int | None = Field(default=None, description="for click/input: the [index] of the element")
-    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: "
-                             + ("the answer — for prices use ONLY e.g. '$54.99'" if PRICE_TUNING else
-                                "the answer ONLY, in one sentence: exactly what was asked. No source, "
-                                "caveats or how you searched: the source goes in `source`, the rest nowhere"))
+    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page"
+                             + ("; for done: the answer — for prices use ONLY e.g. '$54.99'" if PRICE_TUNING else
+                                ". NOT for done: the answer goes in `answer`"))
     # the answer shape in the schema, not just the prompt: with the prompt alone
-    # answers stayed 3–5 sentences (24 Oct smoke run). node_plan joins text and
-    # source into the spoken answer, so nothing downstream changes
+    # answers stayed 3–5 sentences (24 Oct smoke run). the answer has its own
+    # field: when `text` doubled as the answer, the model filled `source` and left
+    # `text` empty (Google Search--19, 25 Oct smoke run). node_plan joins answer
+    # and source into `text`, the spoken answer, so nothing downstream changes
+    answer: str | None = Field(default=None, description="for done ONLY: the answer itself, in one sentence: exactly "
+                               "what was asked. No source, caveats or how you searched: the source goes in `source`, "
+                               "the rest nowhere. If you couldn't finish, what's missing and why")
     source: str | None = Field(default=None, description="for done ONLY: one sentence naming the site the answer "
                                "came from, and any doubt ('not confirmed on the product page', 'sources disagree', "
-                               "'the reviews need a sign-in'). Nothing else")
+                               "'the reviews need a sign-in'). Not the answer itself, which goes in `answer`")
     down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
     success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
 
@@ -135,7 +139,7 @@ class PlanDecision(BaseModel):
             return False
         return None  # anything else -> unset
 
-    @field_validator("url", "text", "source", mode="before")
+    @field_validator("url", "text", "answer", "source", mode="before")
     @classmethod
     def _clean_optional_str(cls, v):
         if isinstance(v, str) and v.strip().lower() in (
@@ -174,7 +178,7 @@ _PRICE_PLANNER_RULES = (
     # longest about a minute in VoiceOver
     "- done: the answer is read aloud by a screen reader, so it has two parts, one "
     "sentence each:\n"
-    "  1. `text` = THE ANSWER: exactly what was asked, one result, no alternatives. "
+    "  1. `answer` = THE ANSWER: exactly what was asked, one result, no alternatives. "
     "If the task asks for several things (a top 5, a date AND a place, two scores), "
     "give all of them, and nothing more. If the question could mean more than one "
     "thing (a premiere or the release, a club season or a calendar year), answer "
@@ -184,8 +188,8 @@ _PRICE_PLANNER_RULES = (
     "('not confirmed on the product page', 'sources disagree', 'the reviews need a "
     "sign-in').\n"
     "  Nothing else: alternatives, extra facts, caveats and how you searched are "
-    "only for when the user asks for more. If you couldn't finish, `text` says what's "
-    "missing and why, in one sentence.\n\n"
+    "only for when the user asks for more. If you couldn't finish, `answer` says what's "
+    "missing and why, in one sentence. `answer` is never left empty.\n\n"
 )
 
 # how the planner answers a FIND / WHAT IS query from Google. the glasses demo
@@ -266,8 +270,8 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "tick the box, solve it, or click through it: choose done with success=false "
     "and say the site asked to check you're human.\n\n"
     "Only use an [index] that actually appears in the elements list. When the "
-    "task is complete, or the answer is already visible, choose done and put the "
-    "answer in `text`. Do not repeat an action that just ran.\n\n"
+    "task is complete, or the answer is already visible, choose done with the "
+    "answer (see the done rule above). Do not repeat an action that just ran.\n\n"
     "IMPORTANT — recognise completion from the actions-taken list. If it shows you "
     "already performed the action that completes the task (e.g. clicked 'Add to "
     "Cart' / 'Add to bag', submitted the form, logged in) and it did NOT error, "
@@ -527,10 +531,15 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     llm = make_planner_llm()
     response = await _ainvoke_with_retry(llm, [PLANNER_SYSTEM, user_msg], PlanDecision)
     decision: PlanDecision = response.completion
-    # the spoken answer is the answer, then its source (PlanDecision.source).
-    # joined here so the verifier, the loop guard and the user all see the same text
-    if decision.action == "done" and decision.text and decision.source:
-        decision.text = f"{decision.text.strip()} {decision.source.strip()}"
+    # the spoken answer is the answer, then its source (PlanDecision.answer,
+    # .source), joined into `text` so the verifier, the loop guard and the user
+    # all see the same thing. an answer put in `text` out of habit (and the
+    # glasses demo's price, which uses `text`) counts too
+    if decision.action == "done":
+        spoken = (decision.answer or decision.text or "").strip()
+        if spoken and decision.source:
+            spoken = f"{spoken} {decision.source.strip()}"
+        decision.text = spoken or None
 
     print(f"  [{step}] plan → {decision.action}")
     return {"last_decision": decision, "step": step}
@@ -652,8 +661,15 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # no verifier call needed. a second empty done trips the loop guard above
     if decision.action == "done" and not (decision.text or "").strip():
         print("  analyse [✗] done: no answer text")
-        return _reject(state, rej_key, "done has no text: put the answer to the request "
-                       "(or why you couldn't finish) in text")
+        field = "text" if PRICE_TUNING else "answer"
+        # say exactly what's missing: "no text" alone didn't stop a model that
+        # had filled `source` from doing it again (Google Search--19, 25 Oct)
+        reason = (f"done has `source` but no `{field}`: the source isn't the answer. Put the "
+                  f"answer itself in `{field}`, in one sentence"
+                  if decision.source else
+                  f"done has no `{field}`: put the answer to the request (or why you "
+                  f"couldn't finish) in `{field}`")
+        return _reject(state, rej_key, reason)
 
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
