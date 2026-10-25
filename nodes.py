@@ -35,7 +35,16 @@ class RespondDecision(BaseModel):
     reasoning: str = Field(description="one sentence: why it's a task or an answer")
 
 
+# with thinking on (llm.py), the structured-output tool is offered, not forced,
+# and the model sometimes replied in plain text instead: browser-use raised
+# "Expected tool use in response but none found" and the step was retried
+# (Google Search--18 step 4, 25 Oct smoke run: two failed calls, 45 s lost).
+# so every prompt that expects a structured reply says so
+_TOOL_REPLY_RULE = ("ALWAYS reply by calling the tool with your decision. Never reply "
+                    "in plain text: anything for the user goes in the tool's fields.\n\n")
+
 RESPOND_SYSTEM = SystemMessage(content=(
+    _TOOL_REPLY_RULE +
     "You are the front desk of a browser assistant for smart glasses. The user "
     "hears your reply spoken aloud — keep it SHORT.\n"
     "- kind='task' if they want you to DO something in the browser: search, find a "
@@ -88,7 +97,15 @@ class PlanDecision(BaseModel):
     url: str | None = Field(default=None, description="for navigate: the URL to open")
     index: int | None = Field(default=None, description="for click/input: the [index] of the element")
     text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: "
-                             + ("the answer — for prices use ONLY e.g. '$54.99'" if PRICE_TUNING else "the answer/result"))
+                             + ("the answer — for prices use ONLY e.g. '$54.99'" if PRICE_TUNING else
+                                "the answer ONLY, in one sentence: exactly what was asked. No source, "
+                                "caveats or how you searched: the source goes in `source`, the rest nowhere"))
+    # the answer shape in the schema, not just the prompt: with the prompt alone
+    # answers stayed 3–5 sentences (24 Oct smoke run). node_plan joins text and
+    # source into the spoken answer, so nothing downstream changes
+    source: str | None = Field(default=None, description="for done ONLY: one sentence naming the site the answer "
+                               "came from, and any doubt ('not confirmed on the product page', 'sources disagree', "
+                               "'the reviews need a sign-in'). Nothing else")
     down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
     success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
 
@@ -118,7 +135,7 @@ class PlanDecision(BaseModel):
             return False
         return None  # anything else -> unset
 
-    @field_validator("url", "text", mode="before")
+    @field_validator("url", "text", "source", mode="before")
     @classmethod
     def _clean_optional_str(cls, v):
         if isinstance(v, str) and v.strip().lower() in (
@@ -155,17 +172,20 @@ _PRICE_PLANNER_RULES = (
     # the answer shape (decided 24 Oct, suggestions #11 "Wordiness"): answers
     # are read aloud, and the extras made the median answer 50 words, the
     # longest about a minute in VoiceOver
-    "- done: set `text` to the final answer for the user. It is read aloud by a "
-    "screen reader, so give it this shape, in this order:\n"
-    "  1. THE ANSWER, in one sentence: exactly what was asked, one result, no "
-    "alternatives. If the task asks for several things (a top 5, a date AND a "
-    "place, two scores), give all of them, and nothing more.\n"
-    "  2. SOURCE AND CONFIDENCE, in one sentence: which site it came from, and any "
-    "doubt ('not confirmed on the product page', 'sources disagree', 'the reviews "
-    "need a sign-in').\n"
-    "  Leave out everything else: alternatives, extra facts and how you searched "
-    "are only for when the user asks for more. If you couldn't finish, say in one "
-    "sentence what's missing and why.\n\n"
+    "- done: the answer is read aloud by a screen reader, so it has two parts, one "
+    "sentence each:\n"
+    "  1. `text` = THE ANSWER: exactly what was asked, one result, no alternatives. "
+    "If the task asks for several things (a top 5, a date AND a place, two scores), "
+    "give all of them, and nothing more. If the question could mean more than one "
+    "thing (a premiere or the release, a club season or a calendar year), answer "
+    "the most common meaning (for a film's release date, the main release, not a "
+    "premiere) and name the other in `source`.\n"
+    "  2. `source` = SOURCE AND CONFIDENCE: which site it came from, and any doubt "
+    "('not confirmed on the product page', 'sources disagree', 'the reviews need a "
+    "sign-in').\n"
+    "  Nothing else: alternatives, extra facts, caveats and how you searched are "
+    "only for when the user asks for more. If you couldn't finish, `text` says what's "
+    "missing and why, in one sentence.\n\n"
 )
 
 # how the planner answers a FIND / WHAT IS query from Google. the glasses demo
@@ -194,9 +214,9 @@ _ANSWERING_RULES = (
     "source, check the current page (and the 'now on' site after your click) is "
     "that site, not google.com; if you're still on Google, open the result itself. If the "
     "source page disagrees with the Overview or snippet, trust the source page and "
-    "say they disagree. If no source page can be opened, you may answer from the "
-    "summary, but say so in the answer (e.g. 'from Google's AI Overview, not "
-    "confirmed on a source page'). Always name the site the answer came from. "
+    "say they disagree in `source`. If no source page can be opened, you may answer "
+    "from the summary, but say so in `source` (e.g. 'from Google's AI Overview, not "
+    "confirmed on a source page'). Always name the site the answer came from, in `source`. "
     "Never fill gaps from your own knowledge: every fact in the answer must come "
     "from a page you read.\n\n"
 )
@@ -205,6 +225,7 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "You are the planner for a browser automation agent. Each turn you get the "
     "user's task and the current page's interactive elements, each tagged with a "
     "[index]. Choose the SINGLE next action that best progresses the task.\n\n"
+    + _TOOL_REPLY_RULE +
     "You MUST fill the fields the chosen action requires — an action with a "
     "missing field is invalid and wastes a step:\n"
     "- navigate: set `url` to a FULL url. ONLY navigate to a url the user gave "
@@ -291,6 +312,7 @@ _VERIFIER_FIND_RULE = (
 )
 
 VERIFIER_SYSTEM = SystemMessage(content=(
+    _TOOL_REPLY_RULE +
     "You are an independent verifier for a browser automation agent. You did NOT "
     "choose the action. Judge ONLY whether the PROPOSED action is a reasonable "
     "step. Do NOT redesign the task, second-guess which item/target the planner "
@@ -341,6 +363,7 @@ VERIFIER_SYSTEM = SystemMessage(content=(
 # especially overlays/popups covering the page and whether a click visually lands
 # on the intended element
 VISION_VERIFIER_SYSTEM = SystemMessage(content=(
+    _TOOL_REPLY_RULE +
     "You are a VISION verifier for a browser agent. You see a SCREENSHOT of the "
     "current VIEWPORT and a proposed action. Crucial: the agent AUTOMATICALLY "
     "SCROLLS the target element into view before clicking, so the target is OFTEN "
@@ -504,6 +527,10 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     llm = make_planner_llm()
     response = await _ainvoke_with_retry(llm, [PLANNER_SYSTEM, user_msg], PlanDecision)
     decision: PlanDecision = response.completion
+    # the spoken answer is the answer, then its source (PlanDecision.source).
+    # joined here so the verifier, the loop guard and the user all see the same text
+    if decision.action == "done" and decision.text and decision.source:
+        decision.text = f"{decision.text.strip()} {decision.source.strip()}"
 
     print(f"  [{step}] plan → {decision.action}")
     return {"last_decision": decision, "step": step}
