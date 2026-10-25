@@ -127,6 +127,39 @@ async def _wait_for_page(session: BrowserSession) -> None:
         await asyncio.sleep(0.25)
 
 
+# pages where a site asks for a person: a captcha, an "I am human" checkbox,
+# Amazon's "Continue shopping" robot check, Cloudflare's "Verify you are human".
+# the agent never gets past one itself (decided 24 Oct, suggestions #5): it
+# stops and hands over. an invisible reCAPTCHA (a badge on an ordinary form) is
+# left out, since it asks nothing of the user
+_BOT_CHECK_JS = """() => {
+  const host = location.host, url = location.href, path = location.pathname;
+  const text = document.body ? document.body.innerText : '';
+  if (host.includes('amazon.')) {
+    if (path.startsWith('/checkpoint/') || (text.includes('To continue, please click the') && text.includes('Continue shopping'))) return 'amazon checkpoint';
+    if (url.includes('validateCaptcha') || text.includes('Enter the characters you see below')) return 'amazon captcha';
+  }
+  if (host.includes('google.') && path.startsWith('/sorry')) return 'google captcha';
+  if (document.querySelector('iframe[src*="challenges.cloudflare.com"]') || /^just a moment/i.test(document.title)) return 'cloudflare check';
+  const widget = [...document.querySelectorAll('iframe[src*="recaptcha/api2/anchor"], iframe[src*="hcaptcha.com"]')]
+    .find(f => !/size=invisible/.test(f.src) && f.offsetWidth > 0);
+  return widget ? 'captcha' : '';
+}"""
+BOT_CHECK_TIMEOUT = 5.0
+
+
+async def _bot_check(session: BrowserSession) -> str | None:
+    # the kind of bot check the current page shows, or None. a page that can't
+    # be read in time isn't evidence of one
+    async def check() -> str:
+        page = await session.must_get_current_page()
+        return await page.evaluate(_BOT_CHECK_JS)
+    try:
+        return await asyncio.wait_for(check(), BOT_CHECK_TIMEOUT) or None
+    except Exception:
+        return None
+
+
 def _run_config(session: BrowserSession, tools: Tools, file_system: FileSystem,
                 thread_id: str) -> RunnableConfig:
     return {

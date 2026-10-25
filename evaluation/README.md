@@ -35,7 +35,9 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   by screenshots, is the correct answer (see Amazon below). it's a 0 if the
   screenshots show it just didn't manage the task.
 - **blocked**: a task with status `blocked` hit a captcha, checkpoint or
-  sign-in wall and didn't finish (see below). the runner retries it once at
+  sign-in wall and didn't finish (see below). since 24 Oct the agent stops at
+  a bot check itself ("Sorry, this site is asking me to prove I'm human…")
+  instead of clicking through it, so these end `blocked` too. the runner retries it once at
   the end of the run (see **retries** below); if it's still blocked, its
   `success` is left blank: don't score it, re-run it. the end of a run prints
   the `--ids` to re-run.
@@ -69,6 +71,12 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   disagree, the screenshots win; a detail in the answer that no screenshot
   shows may come from an extract, so check `steps.jsonl` before marking it
   wrong. (these are WebVoyager's own judging rules.)
+- **main answer only** (from 24 Oct): judge the answer, the first sentence of
+  the reply. a wrong answer isn't rescued by a right one further down or by
+  "another option". a task that asks for several things (a top 5, a date and a
+  place) needs all of them in that answer. since 24 Oct the agent answers in
+  this shape: the answer, then source and confidence, nothing else unless
+  asked. for older runs, judge the first answer the reply gives.
 - **Google Search**: the answer has to agree with the golden reference. if the
   fact has changed since the reference was written ("the latest…") and the
   screenshots show the current one, accept it and say so in `notes`.

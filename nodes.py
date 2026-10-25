@@ -17,7 +17,7 @@ from browser_use.llm.messages import (
 )
 
 from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry, PRICE_TUNING
-from state import PipelineState, MAX_STEPS, _resources, _wait_for_page
+from state import PipelineState, MAX_STEPS, _resources, _wait_for_page, _bot_check
 from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
 
@@ -151,7 +151,22 @@ _PRICE_PLANNER_RULES = (
     "- If the first result is a different brand, still done with `$price (different brand)` "
     "— do NOT keep searching.\n"
     "- If actions-taken already shows an extract with a $ price, choose done immediately.\n\n"
-) if PRICE_TUNING else "- done: set `text` to the final answer/result for the user.\n\n"
+) if PRICE_TUNING else (
+    # the answer shape (decided 24 Oct, suggestions #11 "Wordiness"): answers
+    # are read aloud, and the extras made the median answer 50 words, the
+    # longest about a minute in VoiceOver
+    "- done: set `text` to the final answer for the user. It is read aloud by a "
+    "screen reader, so give it this shape, in this order:\n"
+    "  1. THE ANSWER, in one sentence: exactly what was asked, one result, no "
+    "alternatives. If the task asks for several things (a top 5, a date AND a "
+    "place, two scores), give all of them, and nothing more.\n"
+    "  2. SOURCE AND CONFIDENCE, in one sentence: which site it came from, and any "
+    "doubt ('not confirmed on the product page', 'sources disagree', 'the reviews "
+    "need a sign-in').\n"
+    "  Leave out everything else: alternatives, extra facts and how you searched "
+    "are only for when the user asks for more. If you couldn't finish, say in one "
+    "sentence what's missing and why.\n\n"
+)
 
 # how the planner answers a FIND / WHAT IS query from Google. the glasses demo
 # (PRICE_TUNING) reads the results page and stops, for speed. otherwise Google's
@@ -224,6 +239,11 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "Signs you're blocked by an overlay: your last click errored/timed out, or the "
     "button you want isn't clickable even though you can see it. In that case, look "
     "for a consent/close button and click that first.\n\n"
+    "BOT CHECKS are NOT popups. A page asking you to prove you're human (a captcha, "
+    "an 'I'm not a robot' or 'I am human' checkbox, Amazon's 'Continue shopping' "
+    "robot check, 'Verify you are human') is the site asking for a person. NEVER "
+    "tick the box, solve it, or click through it: choose done with success=false "
+    "and say the site asked to check you're human.\n\n"
     "Only use an [index] that actually appears in the elements list. When the "
     "task is complete, or the answer is already visible, choose done and put the "
     "answer in `text`. Do not repeat an action that just ran.\n\n"
@@ -290,7 +310,10 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "Close, Dismiss, Continue, Accept, or ANY of the modal's own buttons. Getting "
     "past a blocker is always valid progress; do NOT quibble over which dismiss "
     "button is best, and do NOT reject a dismiss action because of where it leaves "
-    "the user.\n\n"
+    "the user. EXCEPT a bot check (a captcha, an 'I'm not a robot' / 'I am human' "
+    "checkbox, Amazon's 'Continue shopping' robot check, 'Verify you are human'): "
+    "REJECT any action that ticks, solves or clicks through one, and say the agent "
+    "must stop and tell the user.\n\n"
     "Judge by action type:\n"
     "- INTERMEDIATE action (click/navigate/input/scroll — anything except done): "
     "APPROVE if it is a sensible next step toward the task, EVEN IF it does not by "
@@ -349,6 +372,9 @@ STUCK_MESSAGE = ("Sorry, I got stuck and couldn't finish this, so I stopped. "
                  "You could try asking in a simpler or more specific way.")
 BAD_ACTION_MESSAGE = ("Sorry, I couldn't work out the next step, so I stopped. "
                       "You could try asking again.")
+BOT_CHECK_MESSAGE = ("Sorry, this site is asking me to prove I'm human. I don't get "
+                     "past those checks myself, so I stopped. You can complete the "
+                     "check on the page and ask me again.")
 
 
 def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
@@ -448,6 +474,17 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     session, _, _ = _resources(config)  # planner only reads the page; execute acts
     step = state.get("step", 0) + 1
 
+    # a bot check is the site asking for a person, and the agent never gets past
+    # one itself (state._BOT_CHECK_JS). checked in code, before the model call,
+    # so the model can't talk itself past one; the prompt rule covers what the
+    # check misses
+    bot = await _bot_check(session)
+    if bot:
+        print(f"  [{step}] plan → stop: bot check ({bot})")
+        stop = PlanDecision(reasoning=f"stopped at a bot check ({bot})", action="done",
+                            success=False, text=BOT_CHECK_MESSAGE)
+        return {"last_decision": stop, "step": step}
+
     summary = await session.get_browser_state_summary()
     dom_text = summary.dom_state.llm_representation()
     # cap the DOM text so a huge page doesn't blow up tokens/cost in the MVP
@@ -520,6 +557,9 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     decision: PlanDecision = state["last_decision"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  (always set by plan)
 
     if decision.action not in ("click", "done"):
+        return Command(goto="execute")
+    # the bot-check stop comes from code, not the model: nothing to verify
+    if decision.action == "done" and decision.text == BOT_CHECK_MESSAGE:
         return Command(goto="execute")
 
     query = state.get("query", "")

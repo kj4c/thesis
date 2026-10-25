@@ -359,7 +359,7 @@ def _describe(node: str, update: dict | None) -> dict:
 # planner stopped itself with its own answer, which can be right: "no product
 # meets the conditions", backed by the screenshots, is the correct answer when
 # a reference has gone stale (Amazon--6). those are reviewed like ok answers
-_STOCK_STOPS = {nodes.STUCK_MESSAGE, nodes.BAD_ACTION_MESSAGE}
+_STOCK_STOPS = {nodes.STUCK_MESSAGE, nodes.BAD_ACTION_MESSAGE, nodes.BOT_CHECK_MESSAGE}
 
 
 def _needs_review(status: str | None, answer: str | None) -> bool:
@@ -508,6 +508,11 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
     # a task the site blocked that then didn't finish says nothing about the
     # agent: it's marked to re-run, not scored. one that finished anyway keeps
     # its status, with the blocks still listed
+    # the agent stops at a bot check itself (nodes.BOT_CHECK_MESSAGE), and can
+    # spot ones the runner's check doesn't (Cloudflare, a captcha widget): a
+    # block either way
+    if answer == nodes.BOT_CHECK_MESSAGE and not blocks:
+        blocks.append({"step": "agent", "kind": "bot check (agent stopped)", "url": ""})
     if blocks and status != "ok":
         status = "blocked"
     return {
