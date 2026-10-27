@@ -147,18 +147,39 @@ _BOT_CHECK_JS = """() => {
   return widget ? 'captcha' : '';
 }"""
 BOT_CHECK_TIMEOUT = 5.0
+# Cloudflare's check often runs by itself ("Verifying…", then the site loads)
+# and only sometimes asks for a click. stopping at once handed the user checks
+# that may have cleared on their own: Google Search--12 in version A stopped 6
+# times on Pro-Football-Reference, each 0.1 s after the page opened on
+# "Verifying…". so a Cloudflare check gets this long to clear before the agent
+# stops; it's only waited out, never clicked. every other kind stops at once.
+# kept well inside the plan node's 30 s timeout, which also covers the model call
+CLOUDFLARE_GRACE = 8.0
 
 
 async def _bot_check(session: BrowserSession) -> str | None:
     # the kind of bot check the current page shows, or None. a page that can't
     # be read in time isn't evidence of one
-    async def check() -> str:
-        page = await session.must_get_current_page()
-        return await page.evaluate(_BOT_CHECK_JS)
-    try:
-        return await asyncio.wait_for(check(), BOT_CHECK_TIMEOUT) or None
-    except Exception:
-        return None
+    async def check(limit: float) -> str | None:
+        async def read() -> str:
+            page = await session.must_get_current_page()
+            return await page.evaluate(_BOT_CHECK_JS)
+        try:
+            return await asyncio.wait_for(read(), limit) or None
+        except Exception:
+            return None
+
+    kind = await check(BOT_CHECK_TIMEOUT)
+    if kind != "cloudflare check":
+        return kind
+    deadline = time.monotonic() + CLOUDFLARE_GRACE
+    while (left := deadline - time.monotonic()) > 0:
+        await asyncio.sleep(min(0.5, left))
+        kind = await check(max(0.5, min(BOT_CHECK_TIMEOUT, deadline - time.monotonic())))
+        if kind != "cloudflare check":
+            await _wait_for_page(session)  # the site it let through is loading
+            return kind
+    return kind
 
 
 # when nodes.node_approve asks the user before a step (§5.2.1):

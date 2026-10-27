@@ -180,15 +180,20 @@ _PRICE_PLANNER_RULES = (
 ) if PRICE_TUNING else (
     # the answer shape (decided 24 Oct, suggestions #11 "Wordiness"): answers
     # are read aloud, and the extras made the median answer 50 words, the
-    # longest about a minute in VoiceOver
+    # longest about a minute in VoiceOver. an ambiguous question is settled by its
+    # own words before "most common": with "a club season or a calendar year" as
+    # the example, Google Search--31 ("in a single season") led with the calendar
+    # year in version A, and put both meanings in `answer` (suggestions #11)
     "- done: the answer is read aloud by a screen reader, so it has two parts, one "
     "sentence each:\n"
     "  1. `answer` = THE ANSWER: exactly what was asked, one result, no alternatives. "
     "If the task asks for several things (a top 5, a date AND a place, two scores), "
     "give all of them, and nothing more. If the question could mean more than one "
-    "thing (a premiere or the release, a club season or a calendar year), answer "
-    "the most common meaning (for a film's release date, the main release, not a "
-    "premiere) and name the other in `source`.\n"
+    "thing, its own words decide first: a word that narrows it ('season', 'in the "
+    "US', 'first', 'regular season') picks that meaning, even if another is more "
+    "common. Only if its words don't settle it, answer the most common meaning (for "
+    "a film's release date, the main release, not a premiere). `answer` gives that "
+    "one meaning only; name the other in `source`, never in `answer`.\n"
     "  2. `source` = SOURCE AND CONFIDENCE: which site it came from, and any doubt "
     "('not confirmed on the product page', 'sources disagree', 'the reviews need a "
     "sign-in').\n"

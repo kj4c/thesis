@@ -85,16 +85,47 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   with the premiere but explains the difference properly is a 1, an exception
   to the main-answer rule; it's a 0 only if the information is wrong. write
   "ambiguous: led with the premiere" in `notes` when it does.
+  an answer taken from Google's AI Overview is judged on whether it's right,
+  as long as it says so: the source has to say it came from the Overview and
+  wasn't confirmed on a source page. the source cards and chips inside the
+  Overview (everything above "AI responses may include mistakes") are part of
+  it, not a source page. an Overview answer that names a site as its source,
+  or doesn't say where it came from, is a 0. (e.g. Google Search--12 in
+  `baseline_bugfix_first` and `versionA_reruns`: both answered from the
+  Overview and its Pro-Football-Reference card, said they didn't open the
+  page, and are a 1.)
 - **Amazon**: judge whether the answer meets the task's conditions on
   amazon.com as the screenshots show it (US delivery address, prices in USD),
   not whether it matches the reference product. Amazon's references are only
   "possible" answers and many have gone stale: listings, prices and review
   counts have changed since 2023. if no product meets the conditions any more,
-  an answer that says so, backed by screenshots (e.g. a filtered list sorted by
-  review count), is a 1; naming a product that doesn't meet them is a 0. say
-  the reference is stale in `notes`. (e.g. Amazon--6: the reference stroller
-  had 22,146 reviews; in October 2026 it has about 5.8K, and no black stroller
-  at $100–200 has over 20,000.)
+  an answer that says so, backed by screenshots (e.g. the list filtered to the
+  task's conditions, sorted by Best Sellers, and more than one page checked), is
+  a 1; naming a product that doesn't meet them is a 0. say the reference is
+  stale in `notes`. a "none" answer can't be proven by checking every page, so
+  the source sentence has to say truthfully what was checked: if it names a
+  sort, filter or page the screenshots don't show, it's a 0, even when the
+  conclusion is right (for a user who can't see the screen, a search that
+  didn't happen is as bad as a wrong product). (e.g. Amazon--6: the reference
+  stroller had 22,146 reviews; in October 2026 it has about 5.8K, and no black
+  stroller at $100–200 has over 20,000. Amazon no longer offers a sort by
+  number of reviews, at least without an account: `s=review-count-rank` in a
+  URL leaves the page on "Sort by: Featured". answers that say "sorted by
+  review count" claim a sort that didn't happen.)
+  where the task names what to search for, the search has to use those words:
+  rewording it changes the results, so the answer is to a different task and
+  is a 0. (e.g. Amazon--3, "climbing gears": a search for "climbing gear"
+  returns different first results, versionA r2.)
+  Amazon--30 ("the highest-rated fiction book released in 2024, with a
+  minimum of 50 customer reviews") has no single right answer: taken
+  literally it's a little-known 4.9-star book, while the reference reads it as
+  a popular novel. so it's judged on how the agent searched, on Amazon. it's a 1
+  only if the screenshots show it (1) limited the search to fiction with
+  Amazon's own category (Books › Literature & Fiction), not by judging titles,
+  (2) limited it to 2024 releases, (3) sorted by customer rating or used an
+  Amazon top-rated or best-seller list for 2024 fiction, and (4) answered with
+  the top title on that list with at least 50 reviews. finding the book through
+  another site, such as Google, is a 0.
 - **content that needs a sign-in**: the agent never signs in, so part of a
   page can be out of reach (e.g. Amazon's full reviews: "Sign in to see
   customer reviews"). if the agent correctly says that a sign-in is what
@@ -133,10 +164,16 @@ defend.
   each hit is listed in the task's `blocked` field (step, kind, URL). a task
   that hits one and doesn't finish gets status `blocked`; one that finishes
   anyway keeps `ok` and is scored as usual. WebVoyager also leaves out tasks
-  that were stopped by captchas or sign-in. a blocked task still runs to its
-  step limit, then is retried at the end of the run. it isn't stopped early:
-  tasks recover from long runs of blocks (Amazon--36 after 5 in a row,
-  Amazon--33 after 4, 24 Oct), so any early cut-off would end good tasks.
+  that were stopped by captchas or sign-in. a blocked task is retried once at
+  the end of the run. since 24 Oct the agent also stops itself at the first bot
+  check it meets (Amazon's checkpoint or captcha, Google's captcha page, a
+  captcha widget, or a Cloudflare check that hasn't cleared after 8 s) and
+  hands it to the user, so a block now usually ends the task at once. before
+  that it clicked through Amazon's checkpoint and often recovered (Amazon--36
+  after 5 blocks in a row, Amazon--33 after 4, 24 Oct). the price: more tasks
+  end `blocked` (1 of 29 first attempts in `baseline_bugfix_first`, 10 of 87
+  in `versionA`), and more re-runs. the runner's own check doesn't look for
+  Cloudflare; the agent's stop marks those tasks `blocked`.
 - **a gap between Amazon tasks.** Amazon flags a burst of fresh, cookie-less
   sessions from one IP as bots, and a flagged session stays blocked for the
   whole task. an Amazon task waits until 90 s after the previous one ended
