@@ -370,10 +370,12 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "The page and the actions-taken list are the truth. If they differ from the "
     "plan, follow the page. Skip a step the page makes unnecessary, and never give "
     "an answer just to finish the plan: if nothing meets the task's conditions, "
-    "say so. Set `revised_plan` ONLY when the plan no longer fits: "
-    "a step failed, your proposal was rejected, or the user said no (use their "
-    "reason). Then give the remaining steps, in the plan's plain style. Otherwise "
-    "leave `revised_plan` empty."
+    "say so. If the latest entry in the actions-taken list is 'user said no: …', "
+    "ALWAYS set `revised_plan`, even if only one step changes: the remaining steps, "
+    "rewritten to follow their reason, so the user hears what changed. Otherwise "
+    "set it ONLY when the plan no longer fits: a step failed or your proposal was "
+    "rejected. Give the remaining steps, in the plan's plain style. In every other "
+    "case leave `revised_plan` empty."
 ))
 
 

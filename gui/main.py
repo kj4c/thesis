@@ -653,6 +653,12 @@ class MainFrame(wx.Frame):
             decision = update['last_decision']
             url, title = await self._current_page()
             description = await self._describe_decision(decision)
+            if update.get('plan'):
+                # the planner changed the plan after a failed or turned-down
+                # step. logged and said before the step, which follows from it,
+                # and so it's spoken before the approval dialog takes focus
+                self._log(f'\n[Plan] Changed. Next: {update["plan"][0]}', speak=True)
+                self._log_plan(update['plan'])
             self._log(f'\nStep {update.get("step", "?")}')
             self._log(f'  On page: {_describe_page(title, url)}')
             # the plain one-line summary written for the user, if the planner
@@ -663,10 +669,6 @@ class MainFrame(wx.Frame):
             if description:
                 self._log(f'  Doing:   {description}')
             self._logged_decision = decision
-            if update.get('plan'):
-                # the planner changed the plan after a failed or turned-down step
-                self._log(f'[Plan] Changed. Next: {update["plan"][0]}', speak=True)
-                self._log_plan(update['plan'])
         elif node == 'analyse' and update.get('scratch'):
             # the agent's own check turned the step down, so it plans again
             reason = str(update['scratch'][-1].get('outcome', ''))
