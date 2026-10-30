@@ -654,9 +654,6 @@ class MainFrame(wx.Frame):
             url, title = await self._current_page()
             description = await self._describe_decision(decision)
             if update.get('plan'):
-                # the planner changed the plan after a failed or turned-down
-                # step. logged and said before the step, which follows from it,
-                # and so it's spoken before the approval dialog takes focus
                 self._log(f'\n[Plan] Changed. Next: {update["plan"][0]}', speak=True)
                 self._log_plan(update['plan'])
             self._log(f'\nStep {update.get("step", "?")}')
