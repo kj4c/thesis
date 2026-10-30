@@ -40,7 +40,7 @@ def _failure_status(error: NodeError) -> str:
         return "rate_limited"
     if error.node == "execute":
         return "execute_failed"
-    if error.node in ("respond", "plan", "analyse"):
+    if error.node in ("respond", "make_plan", "plan", "analyse"):
         return "llm_failed"
     return "failed"
 
@@ -93,13 +93,15 @@ async def default_error_handler(state: PipelineState, error: NodeError) -> Comma
 '''
     the loop:
 
-        START → respond →(task)→ plan → analyse →(approved)→ approve →(yes)→ execute → resolve →(loop)→ plan
-                   │                       │                    │                              →(done)→ END
-                   └──(answer)──→ END       └──(rejected)→ plan  ├──(no + reason)→ plan
-                                                                 └──(stop, or no)→ END
+        START → respond →(task)→ make_plan → plan → analyse →(approved)→ approve →(yes)→ execute → resolve →(loop)→ plan
+                   │                                   │                    │                              →(done)→ END
+                   └──(answer)──→ END                   └──(rejected)→ plan  ├──(no + reason)→ plan
+                                                                             └──(stop, or no)→ END
 
     respond is the front desk: every turn it decides if the message is a task to
-    run in the browser (→ plan) or a question it can answer directly (→ END).
+    run in the browser (→ make_plan) or a question it can answer directly (→ END).
+    make_plan writes the task's plan, a few plain steps for the user, once per
+    task; plan revises it when a step fails or is turned down.
     plan reads the page and picks an action, analyse independently verifies it
     (so a wrong or premature action never reaches the browser), approve asks the
     user if the approval policy calls for it (state.APPROVAL_POLICIES), execute
@@ -123,13 +125,15 @@ def build_agent():
         error_handler=default_error_handler,  # pyright: ignore[reportArgumentType]
         timeout=TimeoutPolicy(run_timeout=30),
     )
-    g.add_node("respond", nodes.node_respond)  # front desk; routes plan | END via Command
+    g.add_node("respond", nodes.node_respond)  # front desk; routes make_plan | END via Command
+    g.add_node("make_plan", nodes.node_make_plan)  # the task's plan, once per task
     g.add_node("plan", nodes.node_plan)
     g.add_node("analyse", nodes.node_analyse)  # verify before acting; routes approve | plan | resolve
     g.add_node("approve", nodes.node_approve)  # the user's say; routes execute | plan | resolve | END
     g.add_node("execute", nodes.node_execute, retry_policy=RetryPolicy(max_attempts=1))
     g.add_node("resolve", nodes.node_resolve)  # routes plan | END via Command
     g.add_edge(START, "respond")
+    g.add_edge("make_plan", "plan")
     g.add_edge("plan", "analyse")
     g.add_edge("execute", "resolve")
     # pausing for approval means state is read back from the checkpoint, which

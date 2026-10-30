@@ -54,6 +54,14 @@ class PipelineState(TypedDict, total=False):
     # different from `messages`, which is the cross-turn chat memory.
     scratch: list[dict]
 
+    # the task's plan: a few plain-language steps the user sees before the
+    # first step (set by make_plan, revised by plan when a step fails or is
+    # turned down). empty for the glasses price tasks, which skip it. written
+    # fresh at the start of every task, so it's never reset at the end
+    plan: list[str]
+    # the one-line version of the plan, said aloud when the task starts
+    plan_summary: str
+
     # how the last turn ended, for the UI / logs (placeholder set).
     # set by respond/resolve on a normal finish and by
     # graph.default_error_handler on a failure:
@@ -71,7 +79,7 @@ class PipelineState(TypedDict, total=False):
     properties that update as it progresses based on current node plan
     - relevant perception information  (partially done: read live in node_plan)
     - adjusted query
-    - current plan (to execute)        (done: `plan` field above)
+    - current plan (to execute)        (done: `plan` field above, from make_plan)
     '''
 
 

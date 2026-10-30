@@ -1,5 +1,5 @@
-# the graph nodes — respond, plan, analyse, execute, resolve — plus the schemas
-# and prompts they use.
+# the graph nodes — respond, make_plan, plan, analyse, approve, execute,
+# resolve — plus the schemas and prompts they use.
 
 from typing import Literal, Any
 import hashlib
@@ -56,9 +56,51 @@ RESPOND_SYSTEM = SystemMessage(content=(
 ))
 
 
-async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[Literal["plan", "__end__"]]:
+# what node_make_plan returns: the task's plan, written once before the first
+# step. it's for the user, the report's "long explanation for plan creation":
+# per-step approval gives the short one. kept small on purpose,
+# since version A had few loops for a plan to fix
+class TaskPlan(BaseModel):
+    steps: list[str] = Field(description="2 to 5 short steps, in the order you'd do them, in plain words for a "
+                             "user who may be blind, e.g. 'Search Google for the film'. No element numbers, URLs "
+                             "or technical terms")
+    summary: str = Field(description="one short sentence said aloud before the first step, e.g. 'I'll search "
+                         "Google, then check the date on its Wikipedia page.'")
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def _clean_steps(cls, v):
+        # a model that writes the steps as one string still gets a list
+        if isinstance(v, str):
+            v = [line.strip(" -•\t") for line in v.splitlines()]
+        return [str(s).strip() for s in (v or []) if str(s).strip()]
+
+
+MAKE_PLAN_SYSTEM = SystemMessage(content=(
+    _TOOL_REPLY_RULE +
+    "You write the plan for a browser assistant's task, before it starts. The "
+    "user may be blind and hears the plan read aloud, so it's short and plain.\n"
+    "- `steps`: 2 to 5 steps, in order, each a few plain words about WHAT to do, "
+    "not how: 'Search Google for the film', 'Open a source page about it', 'Read "
+    "the release date'. No element numbers, URLs or technical terms.\n"
+    "- To look something up, the assistant searches Google, then confirms the fact "
+    "on a source page, since Google's own summaries can be wrong. Plan that way, "
+    "but never write a site's name in a step unless the user named it, not even as "
+    "an example ('such as …'): which source to open is decided from the search "
+    "results.\n"
+    "- Don't assume what the task asks for exists. Write a search or a condition as "
+    "a check ('Check whether any has over 20,000 reviews'), not as if the answer is "
+    "already known ('Open that one'): finding that nothing qualifies is a valid "
+    "result.\n"
+    "- Plan only from the request. Don't guess facts, prices or how a site is "
+    "laid out: the assistant reads each page as it goes.\n"
+    "- `summary`: one short sentence said aloud before the first step."
+))
+
+
+async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[Literal["make_plan", "__end__"]]:
     # the front desk: is this a task to run in the browser, or a question we can
-    # just answer? tasks go to plan; answers we reply to and end the turn. this
+    # just answer? tasks go to make_plan; answers we reply to and end the turn. this
     # is also the conversational mode (e.g. "what's on this page")
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(include_screenshot=False)
@@ -78,7 +120,7 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
 
     if decision.kind == "task":
         print(f"  respond → task")
-        return Command(goto="plan")
+        return Command(goto="make_plan")
 
     # a question / chat — answer it and go back to listening
     answer = decision.answer or "(no answer)"
@@ -87,6 +129,10 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
         "messages": [{"role": "assistant", "content": answer}],
         "status": "ok",
     })
+
+# what Claude's structured output puts in an optional field it doesn't need
+_PLACEHOLDERS = ("", "null", "none", "n/a", "na", "unknown", "<unknown>", "undefined")
+
 
 # what the planner has to return: exactly one next action. kept deliberately
 # small (6 actions) so the schema + prompt stay readable for the MVP; production
@@ -116,6 +162,12 @@ class PlanDecision(BaseModel):
                                "came from, and any doubt ('not confirmed on the product page', 'sources disagree', "
                                "'the reviews need a sign-in'). Not the answer itself, which goes in `answer`")
     down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
+    # replanning happens in this call, not a second make_plan call: the planner
+    # already sees the failure or the user's reason when it picks the next step
+    # (decided 30 Oct). node_plan writes it to state
+    revised_plan: list[str] | None = Field(default=None, description="ONLY when the plan no longer fits, after a "
+                                           "failed step, a rejected proposal or 'user said no': the new plan, "
+                                           "the remaining steps in the same plain style. Otherwise leave it empty")
     success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
 
     # Claude's structured output fills not-applicable optional fields with JUNK
@@ -147,11 +199,19 @@ class PlanDecision(BaseModel):
     @field_validator("url", "text", "answer", "source", "user_summary", mode="before")
     @classmethod
     def _clean_optional_str(cls, v):
-        if isinstance(v, str) and v.strip().lower() in (
-            "", "null", "none", "n/a", "na", "unknown", "<unknown>", "undefined",
-        ):
+        if isinstance(v, str) and v.strip().lower() in _PLACEHOLDERS:
             return None
         return v
+
+    # same junk problem for the list: anything that isn't a list of real steps
+    # means no revision
+    @field_validator("revised_plan", mode="before")
+    @classmethod
+    def _clean_revised_plan(cls, v):
+        if not isinstance(v, list):
+            return None
+        steps = [s.strip() for s in v if isinstance(s, str) and s.strip().lower() not in _PLACEHOLDERS]
+        return steps or None
 
     # success is a plain bool (not optional); junk/blank -> default True
     @field_validator("success", mode="before")
@@ -260,6 +320,16 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "Only navigate to a url the user gave you or a well-known site — NEVER invent a "
     "shop/product url. If a navigation FAILS (can't resolve), don't retry it — go "
     "to a Google search URL instead.\n\n"
+    "TYPED FILTERS AND SORTS: a site silently ignores a filter or sort code in a url "
+    "it doesn't recognise. After navigating to a url with one, your NEXT step "
+    "checks the page applied it, before relying on it: read the 'Sort by' label, "
+    "the result count, the filter chips, and any 'No results… showing all "
+    "departments' banner. A 'Sort by' still on 'Featured', or a result count that "
+    "jumped up, means the code was dropped: don't type it again. Use the page's own "
+    "sort and filter controls instead, and once you've opened a 'Sort by' menu, "
+    "click the option in it rather than typing a url. If the menu has no such "
+    "option, the site can't sort that way: say so. Never name a sort or filter in "
+    "`source` unless the page shows it applied.\n\n"
     "REGIONAL SITES: if a site sends you to a regional version (e.g. amazon.com.au) "
     "or shows prices in another currency, stay on it and work in the currency it "
     "shows. Do NOT try to change the delivery country, region or currency: those "
@@ -294,7 +364,16 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "the item is the wrong product (forks not spoons), scroll or search for the "
     "correct product and target THAT; if it says an overlay is blocking, dismiss "
     "the overlay. If after trying you genuinely cannot find what's needed on this "
-    "page, choose done and honestly state what's missing — do NOT claim success."
+    "page, choose done and honestly state what's missing — do NOT claim success.\n\n"
+    "THE PLAN: you may get a short plan for the task, written before you started. "
+    "It's a guide, not a record: it says what was meant to happen, not what did. "
+    "The page and the actions-taken list are the truth. If they differ from the "
+    "plan, follow the page. Skip a step the page makes unnecessary, and never give "
+    "an answer just to finish the plan: if nothing meets the task's conditions, "
+    "say so. Set `revised_plan` ONLY when the plan no longer fits: "
+    "a step failed, your proposal was rejected, or the user said no (use their "
+    "reason). Then give the remaining steps, in the plan's plain style. Otherwise "
+    "leave `revised_plan` empty."
 ))
 
 
@@ -368,6 +447,15 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "a sign-in (e.g. Amazon's 'Sign in to see customer reviews', shown on the page or "
     "in an extract), and the done text says so and gives the closest answer the page "
     "allows, APPROVE. Do NOT send the agent looking for a way around the sign-in.\n"
+    "  • NOTHING QUALIFIES: a done that says nothing meets the task's conditions is "
+    "a valid answer. APPROVE it if the done text says truthfully what was checked "
+    "(e.g. 'page 1 of 610 results', 'sorted by Avg. Customer Review') and the "
+    "actions-taken list backs that up. Don't assume what the task asks for exists, "
+    "and don't demand every page or a sort the site doesn't offer. You may REJECT "
+    "once, to ask for ONE specific further check that's clearly worth it (e.g. a "
+    "sort the page offers). If the actions-taken list already shows a 'nothing "
+    "qualifies' done rejected, APPROVE this one if it's honest. REJECT if it claims "
+    "a check (a sort, a filter, pages) the actions-taken list doesn't show.\n"
     "  REJECT done only if none of these holds; then say what's still needed.\n\n"
     "When rejecting, give one concrete next step."
 ))
@@ -438,6 +526,26 @@ def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
     return stop.model_validate({"done": {"text": BAD_ACTION_MESSAGE, "success": False}})
 
 
+# what the planner has to fill for each action, and what to tell it when it
+# doesn't. the same checks as _decision_to_action, so analyse can send an
+# incomplete action back before execute turns it into a stop
+_REQUIRED_FIELDS = {
+    "navigate": (("url", "set `url` to a full url"),),
+    "click": (("index", "set `index` to an element's [index] from the list"),),
+    "input": (("index", "set `index` to the field's [index] from the list"),
+              ("text", "set `text` to what to type")),
+    "extract": (("text", "set `text` to what to read off the page"),),
+}
+
+
+def _missing_field(d: PlanDecision) -> tuple[str, str] | None:
+    for field, fix in _REQUIRED_FIELDS.get(d.action, ()):
+        value = getattr(d, field)
+        if value is None or (field == "text" and d.action == "extract" and not value.strip()):
+            return field, fix
+    return None
+
+
 # how much of an action's outcome the planner sees in the actions-taken list.
 # extract gets more: its outcome IS the information the task asked for, and a
 # cut-off answer makes the planner extract again or fill in from memory. 1000
@@ -504,6 +612,39 @@ def _format_scratch(scratch: list[dict], limit: int = 10) -> str:
     )
 
 
+def _format_plan(plan: list[str]) -> str:
+    # the task's plan for the planner, labelled as intent so it isn't read as
+    # a record of what happened (PLANNER_SYSTEM, "THE PLAN")
+    if not plan:
+        return ""
+    lines = "\n".join(f"{i}. {s}" for i, s in enumerate(plan, 1))
+    return f"The plan for this task (a guide; the page is the truth):\n{lines}\n\n"
+
+
+async def node_make_plan(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
+    # write the task's plan once, before the first step: a few plain steps the
+    # user sees in the first approval and the log, and hears as one line. the
+    # glasses price tasks skip it so the demo stays fast (decided 30 Oct)
+    query = state.get("query", "")
+    if _price_shortcuts(query):
+        return {"plan": [], "plan_summary": ""}
+
+    session, _, _ = _resources(config)
+    # only where the browser is, not the page's elements: the plan says what to
+    # do, and the planner reads each page as it goes
+    try:
+        page = f"{await session.get_current_page_title()} ({await session.get_current_page_url()})"
+    except Exception:
+        page = "unknown"
+    history = _format_history(state.get("messages", [])[:-1])
+    user_msg = UserMessage(content=f"{history}Request: {query}\n\nThe browser is on: {page}")
+
+    response = await _ainvoke_with_retry(make_planner_llm(), [MAKE_PLAN_SYSTEM, user_msg], TaskPlan)
+    plan: TaskPlan = response.completion
+    print("  make_plan → " + " | ".join(plan.steps))
+    return {"plan": plan.steps, "plan_summary": plan.summary.strip()}
+
+
 async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
     # read the page, ask the model for the next action. perception (DOM +
     # screenshot) comes from browser-use; the decision comes from our own llm
@@ -534,6 +675,7 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     user_msg = UserMessage(content=(
         f"{history}"
         f"Current request: {state['query']}\n\n"
+        f"{_format_plan(state.get('plan', []))}"
         f"{progress}"
         f"Current page: {summary.title} ({summary.url})\n\n"
         f"Interactive elements:\n{dom_text}"
@@ -553,6 +695,11 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
         decision.text = spoken or None
 
     print(f"  [{step}] plan → {decision.action}")
+    # a price task has no plan to revise
+    if decision.revised_plan and state.get("plan"):
+        new_plan = " | ".join(decision.revised_plan)
+        print(f"  [{step}] plan → new plan: {new_plan}")
+        return {"last_decision": decision, "step": step, "plan": decision.revised_plan}
     return {"last_decision": decision, "step": step}
 
 async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
@@ -603,7 +750,11 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # otherwise a visible popup rejects a valid done answer and the agent loops.
     decision: PlanDecision = state["last_decision"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  (always set by plan)
 
-    if decision.action not in ("click", "done"):
+    # an action missing a field it needs is sent back below, whatever the action:
+    # execute would turn it into a stop and end the task (Amazon--6, 30 Oct smoke
+    # run: an extract with no `text` at step 2)
+    missing = _missing_field(decision)
+    if decision.action not in ("click", "done") and not missing:
         return Command(goto="approve")
     # the bot-check stop comes from code, not the model: nothing to verify
     if decision.action == "done" and decision.text == BOT_CHECK_MESSAGE:
@@ -625,6 +776,10 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     if decision.action == "done" and answer_text:
         digest = hashlib.sha1(answer_text.encode()).hexdigest()[:8]
         rej_key = f"(rejected: done answer={digest})"
+    # keyed on what's missing, not the junk in the other fields, so a second
+    # incomplete action of the same kind trips the guard below and stops
+    if missing:
+        rej_key = f"(rejected: {decision.action} without {missing[0]})"
 
     # rejection loop guard: if this exact action was already rejected AND nothing
     # has actually executed since, the planner is ignoring the feedback and
@@ -681,6 +836,11 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
                   f"done has no `{field}`: put the answer to the request (or why you "
                   f"couldn't finish) in `{field}`")
         return _reject(state, rej_key, reason)
+
+    if missing:
+        field, fix = missing
+        print(f"  analyse [✗] {decision.action}: no {field}")
+        return _reject(state, rej_key, f"{decision.action} has no `{field}`: {fix}")
 
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
@@ -821,7 +981,9 @@ async def node_approve(state: PipelineState, config: RunnableConfig) -> Command[
 
     answer = interrupt({
         "summary": decision.user_summary or decision.reasoning,
-        "action": decision.model_dump(exclude_none=True, exclude={"reasoning", "user_summary"}),
+        # the caller shows the plan on the first question and whenever it changes
+        "plan": state.get("plan", []),
+        "action": decision.model_dump(exclude_none=True, exclude={"reasoning", "user_summary", "revised_plan"}),
         "label": label,
         "page_url": page_url,
         "page_title": page_title,

@@ -306,6 +306,9 @@ class MainFrame(wx.Frame):
         self._config = None
         self._browser_session: BrowserSession | None = None
         self._logged_decision = None
+        # the task plan last shown in an approval dialog, so it's only shown
+        # again when it changes
+        self._shown_plan: list[str] = []
 
         # one persistent asyncio loop for the app's lifetime, so a kept-alive
         # BrowserSession's async resources (event bus, CDP connection) survive
@@ -586,6 +589,7 @@ class MainFrame(wx.Frame):
             },
         }
         self._logged_decision = None
+        self._shown_plan = []
         payload: PipelineState | Command = {
             'query': query, 'messages': [{'role': 'user', 'content': query}],
         }
@@ -640,6 +644,10 @@ class MainFrame(wx.Frame):
 
     async def _log_update(self, node: str, update: dict):
         # one graph node just finished; `update` is what it wrote to the state
+        if node == 'make_plan' and update.get('plan'):
+            # the task's plan: one line said aloud, the steps in the log
+            self._log(f'[Plan] {update.get("plan_summary") or "Here is my plan."}', speak=True)
+            self._log_plan(update['plan'])
         if node == 'plan':
             self._set_status(RUNNING)
             decision = update['last_decision']
@@ -647,13 +655,18 @@ class MainFrame(wx.Frame):
             description = await self._describe_decision(decision)
             self._log(f'\nStep {update.get("step", "?")}')
             self._log(f'  On page: {_describe_page(title, url)}')
-            # the plain one-line summary written for the user, if the planner gave one
+            # the plain one-line summary written for the user, if the planner
+            # gave one. "Step", since "Plan" is now the task's plan
             summary = getattr(decision, 'user_summary', None) or decision.reasoning
             if summary:
-                self._log(f'  Plan:    {summary}')
+                self._log(f'  Step:    {summary}')
             if description:
                 self._log(f'  Doing:   {description}')
             self._logged_decision = decision
+            if update.get('plan'):
+                # the planner changed the plan after a failed or turned-down step
+                self._log(f'[Plan] Changed. Next: {update["plan"][0]}', speak=True)
+                self._log_plan(update['plan'])
         elif node == 'analyse' and update.get('scratch'):
             # the agent's own check turned the step down, so it plans again
             reason = str(update['scratch'][-1].get('outcome', ''))
@@ -668,6 +681,10 @@ class MainFrame(wx.Frame):
             if error:
                 self._log(f'  Problem: {error}')
                 self._set_status(ERROR)  # back to Running when it plans again
+
+    def _log_plan(self, plan: list[str]):
+        for i, step in enumerate(plan, 1):
+            self._log(f'  {i}. {step}')
 
     async def _current_page(self) -> tuple[str, str]:
         session = self._browser_session
@@ -695,9 +712,13 @@ class MainFrame(wx.Frame):
             self._log(f'  Doing:   {description}')
             self._logged_decision = decision
 
+        # the task plan on the first question, and again only when it changes
+        plan = question.get('plan') or []
+        new_plan = plan if plan != self._shown_plan else []
+        self._shown_plan = plan
         text = self._format_permission_description(
             question.get('summary', ''), description,
-            question.get('page_url', ''), question.get('page_title', ''),
+            question.get('page_url', ''), question.get('page_title', ''), new_plan,
         )
         self._set_status(STOPPED)
         await asyncio.get_running_loop().run_in_executor(
@@ -709,10 +730,14 @@ class MainFrame(wx.Frame):
         return answer
 
     @staticmethod
-    def _format_permission_description(goal: str, description: str, url: str, title: str) -> str:
+    def _format_permission_description(goal: str, description: str, url: str, title: str,
+                                       plan: list[str] | None = None) -> str:
         lines = []
+        if plan:
+            lines.append('Task plan:')
+            lines.extend(f'  {i}. {step}' for i, step in enumerate(plan, 1))
         if goal:
-            lines.append(f'Plan: {goal}')
+            lines.append(f'Step: {goal}')
         if description:
             lines.append(f'Action: {description}')
         if url:

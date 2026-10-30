@@ -333,10 +333,13 @@ def _describe(node: str, update: dict | None) -> dict:
     update = update or {}
     if node == "respond":
         return {"routed": "answer" if update.get("messages") else "task"}
+    if node == "make_plan":
+        return {"plan": update.get("plan"), "summary": update.get("plan_summary")}
     if node == "plan":
         d = update["last_decision"]
+        # a revised plan is in the action as `revised_plan`; "plan" says it was taken
         return {"step": update.get("step"), "action": d.model_dump(exclude_none=True, exclude={"reasoning"}),
-                "reasoning": d.reasoning}
+                "reasoning": d.reasoning} | ({"plan": update["plan"]} if "plan" in update else {})
     if node == "analyse":
         if "last_decision" in update:  # a loop guard swapped in a stop
             return {"verdict": "forced_stop", "action": update["last_decision"].model_dump(exclude_none=True)}
