@@ -87,10 +87,21 @@ VISION_MODEL = os.getenv("VISION_MODEL", _VISION_DEFAULTS.get(VISION_PROVIDER, "
 
 
 def make_vision_llm():
-    # returns None when vision is disabled -> analyse uses DOM-only verification
-    if not USE_VISION:
+    # returns None when vision is disabled -> analyse uses DOM-only verification.
+    # vision only (PERCEPTION=vision) always has it: there it's the only verifier
+    if not USE_VISION and PERCEPTION != "vision":
         return None
     return _build_llm(VISION_PROVIDER, VISION_MODEL)
+
+
+# ── perception: what the planner sees of the page (suggestions #4, #10) ─────
+# the four versions in the comparison: dom (the element list, the agent as it
+# was), vision (a screenshot with numbered boxes instead), hybrid (both), and
+# vision with VERIFIER=off (no model checks). the defaults are the dom agent
+PERCEPTION = os.getenv("PERCEPTION", "dom").strip().lower()
+if PERCEPTION not in ("dom", "vision", "hybrid"):
+    raise ValueError(f"Unknown PERCEPTION {PERCEPTION!r}; use dom | vision | hybrid")
+VERIFIER = os.getenv("VERIFIER", "on").strip().lower() not in ("0", "off", "false", "no")
 
 
 # ── glasses POV input (independent of USE_VISION analyse gate) ───────────────

@@ -2,9 +2,14 @@
 # resolve — plus the schemas and prompts they use.
 
 from typing import Literal, Any
+import asyncio
+import base64
 import hashlib
+import io
 import re
 from urllib.parse import urlparse
+
+from PIL import Image
 
 from pydantic import BaseModel, Field, field_validator
 from langgraph.graph import END
@@ -12,11 +17,13 @@ from langgraph.types import Command, interrupt
 from langchain_core.runnables import RunnableConfig
 
 from browser_use import Tools, ActionResult
+from browser_use.browser.python_highlights import create_highlighted_screenshot
 from browser_use.llm.messages import (
     SystemMessage, UserMessage, ContentPartTextParam, ContentPartImageParam, ImageURL,
 )
 
-from llm import make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry, PRICE_TUNING
+from llm import (make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry,
+                 PRICE_TUNING, PERCEPTION, VERIFIER)
 from state import PipelineState, MAX_STEPS, _resources, _wait_for_page, _bot_check
 from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
@@ -303,10 +310,33 @@ _ANSWERING_RULES = (
     "from a page you read.\n\n"
 )
 
+# what the planner is told about how it sees the page, by PERCEPTION (#4).
+# one prompt with a paragraph per mode, so the rest is the same in every version.
+# the dom version gets nothing extra: it's the agent as it was
+_PERCEPTION_RULES = {
+    "dom": "",
+    "vision": (
+        "HOW YOU SEE THE PAGE: you get a SCREENSHOT of the visible part of the page, "
+        "not an element list. Each interactive element has a box drawn on it with its "
+        "[index] number; use that number as `index`. Wherever these instructions say "
+        "'the elements list', read 'the numbered boxes on the screenshot'. `extract` "
+        "is NOT available: read what you need off the screenshot, and scroll to see "
+        "more of the page.\n\n"
+    ),
+    "hybrid": (
+        "HOW YOU SEE THE PAGE: you get the element list AND a SCREENSHOT of the visible "
+        "part of the page, with each interactive element's box and [index] number drawn "
+        "on it, the same numbers as the list. Use the screenshot to see the layout, "
+        "what's on screen and anything covering it; the list has elements outside the "
+        "screenshot too.\n\n"
+    ),
+}[PERCEPTION]
+
 PLANNER_SYSTEM = SystemMessage(content=(
     "You are the planner for a browser automation agent. Each turn you get the "
     "user's task and the current page's interactive elements, each tagged with a "
     "[index]. Choose the SINGLE next action that best progresses the task.\n\n"
+    + _PERCEPTION_RULES
     + _TOOL_REPLY_RULE +
     "You MUST fill the fields the chosen action requires — an action with a "
     "missing field is invalid and wastes a step:\n"
@@ -708,6 +738,36 @@ async def node_make_plan(state: PipelineState, config: RunnableConfig) -> dict[s
     return {"plan": plan.steps, "plan_summary": plan.summary.strip()}
 
 
+async def _numbered_screenshot(summary) -> str | None:
+    # the page's screenshot with each interactive element's box and [index]
+    # drawn on it (Set-of-Mark), for the screenshot versions (#4). shrunk to the
+    # page's own size first (the Retina screenshot is twice that), then drawn on
+    # at that size: drawing first and shrinking after left the numbers about 6 px
+    # tall. half the image tokens, and coordinates are in page pixels. only the
+    # copy sent to the model is drawn on; the saved screenshots stay clean
+    if not summary.screenshot:
+        return None
+
+    def shrink() -> str:
+        image = Image.open(io.BytesIO(base64.b64decode(summary.screenshot)))
+        info = summary.page_info
+        if info and (image.width, image.height) != (info.viewport_width, info.viewport_height):
+            image = image.resize((info.viewport_width, info.viewport_height), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        return base64.b64encode(out.getvalue()).decode()
+
+    try:
+        shrunk = await asyncio.to_thread(shrink)
+        # filter_highlight_ids=False: a number on every box, not only the ones
+        # without readable text, so every element can be named by its [index]
+        return await create_highlighted_screenshot(shrunk, summary.dom_state.selector_map,
+                                                   device_pixel_ratio=1.0, filter_highlight_ids=False)
+    except Exception as e:
+        print(f"  (numbered screenshot failed: {type(e).__name__}: {str(e)[:80]})")
+        return None
+
+
 async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
     # read the page, ask the model for the next action. perception (DOM +
     # screenshot) comes from browser-use; the decision comes from our own llm
@@ -735,15 +795,29 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     history = _format_history(state.get("messages", [])[:-1])
     # actions taken THIS task — the within-task memory that stops oscillation
     progress = _format_scratch(state.get("scratch", []))
-    user_msg = UserMessage(content=(
+    text = (
         f"{history}"
         f"Current request: {state['query']}\n\n"
         f"{_format_plan(state.get('plan', []))}"
         f"{progress}"
         f"Step {step} of {MAX_STEPS}\n\n"
         f"Current page: {summary.title} ({summary.url})\n\n"
-        f"Interactive elements:\n{dom_text}"
-    ))
+    )
+    # what the planner sees of the page, by PERCEPTION (#4): the element list,
+    # the numbered screenshot, or both
+    if PERCEPTION == "dom":
+        user_msg = UserMessage(content=text + f"Interactive elements:\n{dom_text}")
+    else:
+        shot = await _numbered_screenshot(summary)
+        if PERCEPTION == "hybrid":
+            text += f"Interactive elements:\n{dom_text}\n\n"
+        text += ("The screenshot of the visible page is below, with the [index] numbers on "
+                 "the boxes." if shot else
+                 "No screenshot could be taken this step: scroll or wait, then look again.")
+        parts: list[ContentPartTextParam | ContentPartImageParam] = [ContentPartTextParam(text=text)]
+        if shot:
+            parts.append(ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{shot}")))
+        user_msg = UserMessage(content=parts)
 
     llm = make_planner_llm()
     response = await _ainvoke_with_retry(llm, [PLANNER_SYSTEM, user_msg], PlanDecision)
@@ -788,7 +862,7 @@ async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
 
 
 async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
-                         screenshot: str | None) -> Verdict | None:
+                         screenshot: str | None, step: int | None = None) -> Verdict | None:
     # channel 2: judge the action from the SCREENSHOT (a vision model). returns
     # None if vision is off / no screenshot / the call fails — caller then falls
     # back to DOM-only so the agent never breaks just because vision is unavailable
@@ -799,10 +873,13 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
         parts = [
             ContentPartTextParam(text=(
                 f"Task: {query}\n\n{progress}"
+                + (f"Step {step} of {MAX_STEPS}\n\n" if step is not None else "") +
                 f"Proposed action: {decision.action} "
                 f"(index={decision.index}, url={decision.url}, text={decision.text})\n"
                 f"Planner's reasoning: {decision.reasoning}\n\n"
-                f"Judge from the screenshot below."
+                + ("Judge from the screenshot below. Each interactive element's box has its "
+                   "[index] number drawn on it: the action's index is the number on its box."
+                   if PERCEPTION == "vision" else "Judge from the screenshot below.")
             )),
             ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{screenshot}")),
         ]
@@ -826,9 +903,13 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # a hint in the outcome after SCROLL_NUDGE scrolls didn't stop the planner
     # scrolling for a button (Amazon--16, 1 Nov smoke run), and it does change
     # course after a rejection, so the next scroll is rejected here
-    scroll_run = (decision.action == "scroll"
+    # not in vision only: with no extract, scrolling is how it reads a page.
+    # the stop for scrolling up and down (node_execute) still applies there
+    scroll_run = (decision.action == "scroll" and PERCEPTION != "vision"
                   and len(_scrolls_in_a_row(state.get("scratch", []))) >= SCROLL_NUDGE)
-    if decision.action not in ("click", "done") and not missing and not scroll_run:
+    # vision only has no extract (decided 30 Oct): the model reads the screenshot
+    no_extract = decision.action == "extract" and PERCEPTION == "vision"
+    if decision.action not in ("click", "done") and not missing and not scroll_run and not no_extract:
         return Command(goto="approve")
     # the bot-check stop comes from code, not the model: nothing to verify
     if decision.action == "done" and decision.text == BOT_CHECK_MESSAGE:
@@ -918,11 +999,35 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
             f"what you're looking for off the page (extract reads the whole page, not just "
             f"what's on screen), or choose done and say what's missing"))
 
+    if no_extract:
+        print("  analyse [✗] extract: not in vision only")
+        return _reject(state, rej_key, (
+            "extract isn't available: read what you need off the screenshot, scroll to "
+            "see more, or choose done"))
+
+    # the no-verifier version: the checks in code above stay, the model checks go
+    if not VERIFIER:
+        return Command(goto="approve")
+
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
-    dom_text = summary.dom_state.llm_representation()[:DOM_LIMIT]
     progress = _format_scratch(state.get("scratch", []))
 
+    # vision only: the vision verifier is the only one, so it decides, and it
+    # checks done too (decided 30 Oct). it sees the numbered screenshot the
+    # planner saw, so it can tell which box an [index] is. no answer from it
+    # (the call failed) lets the action through, as no verifier would
+    if PERCEPTION == "vision":
+        vis_v = await _verify_vision(decision, query, progress, await _numbered_screenshot(summary),
+                                     step=state.get("step", 0))
+        if vis_v is None or vis_v.approved:
+            print(f"  analyse [✓] {decision.action} (vision): {vis_v.reason[:100] if vis_v else 'no verdict'}")
+            return Command(goto="approve")
+        print(f"  analyse [✗] {decision.action} (vision): {vis_v.reason[:100]}")
+        return _reject(state, rej_key, f"VISION: {vis_v.reason}",
+                       answer=answer_text if decision.action == "done" else None)
+
+    dom_text = summary.dom_state.llm_representation()[:DOM_LIMIT]
     dom_v = await _verify_dom(decision, query, dom_text, progress,
                               summary.title, summary.url, state.get("step", 0))
     # skip vision for done and for price tasks (saves ~2s per step, fewer overlay loops)
@@ -1195,7 +1300,7 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
             # (Google Search--7, 24 Oct smoke run). the host is short, so it goes
             # after the cut and always survives it
             landed = f" -> now on {urlparse(after.url).netloc or after.url}"
-        elif action_name == "scroll" and len(scrolls) >= SCROLL_NUDGE:
+        elif action_name == "scroll" and len(scrolls) >= SCROLL_NUDGE and PERCEPTION != "vision":
             # after the cut, like landed, so the nudge always survives it
             landed = (f" ({len(scrolls)} scrolls in a row: extract what you're looking for "
                       f"off the page instead, or choose done and say what's missing)")
