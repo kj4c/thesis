@@ -166,6 +166,13 @@ async def _ainvoke_with_retry(llm: BaseChatModel, messages: list[BaseMessage],
             return await llm.ainvoke(messages, output_format=output_format)
         except (ModelRateLimitError, ModelProviderError) as e:
             msg = str(e)
+            # a reply missing required fields is a bad draw, not a limit: ask
+            # again. the planner sent only `text` or `answer`, without `action`
+            # or `reasoning`, 5 times in versions B and C (31 Oct – 1 Nov); each
+            # ended the task as llm_failed, and the task's re-run passed every time
+            if "validation error" in msg and i < attempts - 1:
+                print("  model reply was missing fields; asking again…")
+                continue
             is_rate = (isinstance(e, ModelRateLimitError)
                        or "429" in msg or "rate_limit" in msg or "RESOURCE_EXHAUSTED" in msg)
             if not is_rate:
