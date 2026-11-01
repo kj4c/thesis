@@ -102,6 +102,11 @@ PERCEPTION = os.getenv("PERCEPTION", "dom").strip().lower()
 if PERCEPTION not in ("dom", "vision", "hybrid"):
     raise ValueError(f"Unknown PERCEPTION {PERCEPTION!r}; use dom | vision | hybrid")
 VERIFIER = os.getenv("VERIFIER", "on").strip().lower() not in ("0", "off", "false", "no")
+# vision only: also send a clean copy of the screenshot, before the numbered one.
+# the number labels cover some of the page's text (Kilimanjaro's "19,341 ft" on
+# Wikipedia, 1 Nov), and vision only has nothing else to read it from. off = the
+# numbered screenshot alone, as in WebVoyager. the pilot runs both (game plan)
+VISION_CLEAN = os.getenv("VISION_CLEAN", "off").strip().lower() in ("1", "on", "true", "yes")
 
 
 # ── glasses POV input (independent of USE_VISION analyse gate) ───────────────

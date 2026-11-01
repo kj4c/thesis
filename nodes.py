@@ -23,7 +23,7 @@ from browser_use.llm.messages import (
 )
 
 from llm import (make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry,
-                 PRICE_TUNING, PERCEPTION, VERIFIER)
+                 PRICE_TUNING, PERCEPTION, VERIFIER, VISION_CLEAN)
 from state import PipelineState, MAX_STEPS, _resources, _wait_for_page, _bot_check
 from reply_format import compact_glasses_reply, is_price_task, price_from_text
 
@@ -322,6 +322,10 @@ _PERCEPTION_RULES = {
         "'the elements list', read 'the numbered boxes on the screenshot'. `extract` "
         "is NOT available: read what you need off the screenshot, and scroll to see "
         "more of the page.\n\n"
+        + ("You get TWO screenshots of the same view: the first clean, the second with "
+           "the numbered boxes. Read text and numbers from the clean one, since the "
+           "labels can cover text; take the [index] values from the numbered one.\n\n"
+           if VISION_CLEAN else "")
     ),
     "hybrid": (
         "HOW YOU SEE THE PAGE: you get the element list AND a SCREENSHOT of the visible "
@@ -738,15 +742,16 @@ async def node_make_plan(state: PipelineState, config: RunnableConfig) -> dict[s
     return {"plan": plan.steps, "plan_summary": plan.summary.strip()}
 
 
-async def _numbered_screenshot(summary) -> str | None:
+async def _screenshots(summary) -> tuple[str | None, str | None]:
     # the page's screenshot with each interactive element's box and [index]
     # drawn on it (Set-of-Mark), for the screenshot versions (#4). shrunk to the
     # page's own size first (the Retina screenshot is twice that), then drawn on
     # at that size: drawing first and shrinking after left the numbers about 6 px
     # tall. half the image tokens, and coordinates are in page pixels. only the
-    # copy sent to the model is drawn on; the saved screenshots stay clean
+    # copy sent to the model is drawn on; the saved screenshots stay clean.
+    # returns (clean, numbered), both at page size; either is None if it failed
     if not summary.screenshot:
-        return None
+        return None, None
 
     def shrink() -> str:
         image = Image.open(io.BytesIO(base64.b64decode(summary.screenshot)))
@@ -759,13 +764,26 @@ async def _numbered_screenshot(summary) -> str | None:
 
     try:
         shrunk = await asyncio.to_thread(shrink)
+    except Exception as e:
+        print(f"  (screenshot failed: {type(e).__name__}: {str(e)[:80]})")
+        return None, None
+    try:
         # filter_highlight_ids=False: a number on every box, not only the ones
         # without readable text, so every element can be named by its [index]
-        return await create_highlighted_screenshot(shrunk, summary.dom_state.selector_map,
-                                                   device_pixel_ratio=1.0, filter_highlight_ids=False)
+        return shrunk, await create_highlighted_screenshot(
+            shrunk, summary.dom_state.selector_map, device_pixel_ratio=1.0, filter_highlight_ids=False)
     except Exception as e:
         print(f"  (numbered screenshot failed: {type(e).__name__}: {str(e)[:80]})")
-        return None
+        return shrunk, None
+
+
+def _images(clean: str | None, numbered: str | None) -> list[ContentPartImageParam]:
+    # what the screenshot versions send: the numbered screenshot, and in vision
+    # only with VISION_CLEAN the clean one before it (llm.VISION_CLEAN)
+    shots = [clean] if PERCEPTION == "vision" and VISION_CLEAN else []
+    shots.append(numbered)
+    return [ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{s}"))
+            for s in shots if s]
 
 
 async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
@@ -808,15 +826,18 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     if PERCEPTION == "dom":
         user_msg = UserMessage(content=text + f"Interactive elements:\n{dom_text}")
     else:
-        shot = await _numbered_screenshot(summary)
+        clean, shot = await _screenshots(summary)
         if PERCEPTION == "hybrid":
             text += f"Interactive elements:\n{dom_text}\n\n"
-        text += ("The screenshot of the visible page is below, with the [index] numbers on "
-                 "the boxes." if shot else
+        two = PERCEPTION == "vision" and VISION_CLEAN and clean
+        text += (("The clean screenshot of the visible page is below, then the same view "
+                  "with the [index] numbers on the boxes." if two else
+                  "The screenshot of the visible page is below, with the [index] numbers on "
+                  "the boxes.") if shot else
                  "No screenshot could be taken this step: scroll or wait, then look again.")
         parts: list[ContentPartTextParam | ContentPartImageParam] = [ContentPartTextParam(text=text)]
         if shot:
-            parts.append(ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{shot}")))
+            parts += _images(clean, shot)
         user_msg = UserMessage(content=parts)
 
     llm = make_planner_llm()
@@ -862,7 +883,8 @@ async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
 
 
 async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
-                         screenshot: str | None, step: int | None = None) -> Verdict | None:
+                         screenshot: str | None, step: int | None = None,
+                         clean: str | None = None) -> Verdict | None:
     # channel 2: judge the action from the SCREENSHOT (a vision model). returns
     # None if vision is off / no screenshot / the call fails — caller then falls
     # back to DOM-only so the agent never breaks just because vision is unavailable
@@ -870,7 +892,8 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
     if llm is None or not screenshot:
         return None
     try:
-        parts = [
+        two = PERCEPTION == "vision" and VISION_CLEAN and clean
+        parts: list[ContentPartTextParam | ContentPartImageParam] = [
             ContentPartTextParam(text=(
                 f"Task: {query}\n\n{progress}"
                 + (f"Step {step} of {MAX_STEPS}\n\n" if step is not None else "") +
@@ -880,9 +903,12 @@ async def _verify_vision(decision: "PlanDecision", query: str, progress: str,
                 + ("Judge from the screenshot below. Each interactive element's box has its "
                    "[index] number drawn on it: the action's index is the number on its box."
                    if PERCEPTION == "vision" else "Judge from the screenshot below.")
+                + (" The first image is the same view without the boxes: read the page's "
+                   "text and numbers from it, since the labels can cover text." if two else "")
             )),
-            ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{screenshot}")),
         ]
+        parts += (_images(clean, screenshot) if PERCEPTION == "vision" else
+                  [ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{screenshot}"))])
         r = await _ainvoke_with_retry(llm, [VISION_VERIFIER_SYSTEM, UserMessage(content=parts)], Verdict)
         return r.completion
     except Exception as e:
@@ -1018,8 +1044,9 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # planner saw, so it can tell which box an [index] is. no answer from it
     # (the call failed) lets the action through, as no verifier would
     if PERCEPTION == "vision":
-        vis_v = await _verify_vision(decision, query, progress, await _numbered_screenshot(summary),
-                                     step=state.get("step", 0))
+        clean, shot = await _screenshots(summary)
+        vis_v = await _verify_vision(decision, query, progress, shot,
+                                     step=state.get("step", 0), clean=clean)
         if vis_v is None or vis_v.approved:
             print(f"  analyse [✓] {decision.action} (vision): {vis_v.reason[:100] if vis_v else 'no verdict'}")
             return Command(goto="approve")

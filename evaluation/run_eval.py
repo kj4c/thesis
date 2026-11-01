@@ -615,7 +615,7 @@ def _config(args, tasks: list) -> dict:
         "tasks_sha256": hashlib.sha256(TASKS.read_bytes()).hexdigest(),
         "planner": [llm.PLANNER_PROVIDER, llm.PLANNER_MODELS.get(llm.PLANNER_PROVIDER)],
         "claude_effort": os.getenv("CLAUDE_EFFORT", "medium"),
-        "perception": llm.PERCEPTION, "verifier": llm.VERIFIER,
+        "perception": llm.PERCEPTION, "verifier": llm.VERIFIER, "vision_clean": llm.VISION_CLEAN,
         "use_vision": llm.USE_VISION, "vision": [llm.VISION_PROVIDER, llm.VISION_MODEL],
         "extraction": [llm.EXTRACTION_PROVIDER, llm.EXTRACTION_MODEL],
         "price_tuning": llm.PRICE_TUNING, "max_steps": MAX_STEPS, "task_timeout": TASK_TIMEOUT, "approval": "auto",
