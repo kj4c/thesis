@@ -85,6 +85,12 @@ whether it did what the task asked. record it in the run's `summary.csv`.
 - **Google Search**: the answer has to agree with the golden reference. if the
   fact has changed since the reference was written ("the latest…") and the
   screenshots show the current one, accept it and say so in `notes`.
+  a relative date in the question has gone stale the same way: the tasks were
+  written in 2023, so Google Search--14's "the year before last" meant 2021,
+  when Jimmy Smith left Yeovil Town (the reference). an answer of Yeovil Town
+  that says the retirement year doesn't match or isn't confirmed is a 1; the
+  agent can't know when the question was written. (e.g. smoke_versionC_dom r2,
+  where the checking step turned the right answer down over the year.)
   Google Search--0 ("initial release date") is ambiguous: the 22 April 2023
   premiere or the 5 May 2023 US release (the reference). an answer that leads
   with the premiere but explains the difference properly is a 1, an exception

@@ -381,6 +381,15 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "what you couldn't confirm: an honest partial answer beats none. After a "
     "rejection, if two steps haven't got you closer to what it asked for, do the "
     "same rather than keep searching.\n\n"
+    # Google Search--14 r1 in the 1 Nov smoke rerun went round Transfermarkt for a
+    # James Smith who retired in 2024 until a loop guard stopped it; the runs that
+    # answered (the reference) said the retirement year didn't match
+    "A PREMISE the request takes for granted about what it asks about ('the "
+    "retired players the year before last named James Smith': that he retired "
+    "then) isn't a task of its own. Answer what's asked from the best match you "
+    "find, and if the page doesn't confirm the premise, say so in `source`. Don't "
+    "spend steps searching for proof of it. What the request asks you to find, "
+    "like which film is the latest, is the answer, not a premise: check that.\n\n"
     "THE PLAN: you may get a short plan for the task, written before you started. "
     "It's a guide, not a record: it says what was meant to happen, not what did. "
     "The page and the actions-taken list are the truth. If they differ from the "
@@ -426,10 +435,11 @@ _VERIFIER_FIND_RULE = (
     # because the page didn't show the player retiring "the year before last".
     # the agent searched for that until it ran out of steps (31 Oct)
     "  • A PREMISE the task takes for granted (that the player retired the year "
-    "before last, that a film is the latest one) that no page confirmed is NOT a "
-    "reason to send the agent searching again. If what was asked is answered and "
-    "supported, APPROVE when the done text says that part is unconfirmed; if it "
-    "doesn't say so, REJECT only to ask for that doubt in `source`, then done again.\n"
+    "before last) that no page confirmed is NOT a reason to send the agent "
+    "searching again. If what was asked is answered and supported, APPROVE when the "
+    "done text says that part is unconfirmed; if it doesn't say so, REJECT only to "
+    "ask for that doubt in `source`, then done again. What the task asks to find "
+    "(which film is the latest) is the answer, not a premise, and needs support.\n"
 )
 
 VERIFIER_SYSTEM = SystemMessage(content=(
@@ -624,8 +634,11 @@ def _extract_answer(content: str) -> str:
 
 # how much of the page's element list the planner and the checking step read.
 # evaluation logs each page's full length (run_eval.py, dom_chars) to see how
-# often it cuts: Amazon--16's size buttons may be past it (1 Nov smoke run)
-DOM_LIMIT = 6000
+# often it cuts. it was 6000: Amazon product pages run 15–25K, and Amazon--16's
+# size buttons were never before character 8,288, so XX-Large couldn't be
+# clicked however the agent scrolled (1 Nov smoke run). 25K holds every page
+# that run logged; Google's pages ran 2–15K, so they cost no more
+DOM_LIMIT = 25000
 
 
 def _format_history(messages: list[dict], limit: int = 6) -> str:
@@ -742,6 +755,10 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     if decision.action == "done":
         spoken = (decision.answer or decision.text or "").strip()
         if spoken and decision.source:
+            # an answer of a few words has no full stop ("Yeovil Town"), and ran
+            # into the source when read aloud (Google Search--14, 1 Nov smoke run)
+            if spoken[-1] not in ".!?\"'”’)":
+                spoken += "."
             spoken = f"{spoken} {decision.source.strip()}"
         decision.text = spoken or None
 
