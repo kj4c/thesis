@@ -18,13 +18,15 @@
 #   summary.csv   the same per task (its last attempt), with a `success`
 #                 column to score. a task that didn't end with status ok is
 #                 filled in as 0 already, except: an ending in RETRY_STATUSES
-#                 (the site blocked the browser, setup failed, or the model API
-#                 failed) that is still there after the retries, left blank to
+#                 (the site blocked the browser, setup failed, the model API
+#                 failed, or Amazon ran on a regional site) that is still there after the retries, left blank to
 #                 re-run rather than score; and a gave_up with the agent's own
 #                 answer, left blank to review
 #   screenshots/  per task: the page the planner read at each step (stepNN.png)
 #                 and the page at the end (final.png). both of WebVoyager's
-#                 scoring methods judge from these
+#                 scoring methods judge from these. stepNN_dom.txt is that
+#                 step's whole element list; the planner read only its first
+#                 nodes.DOM_LIMIT characters (dom_chars in the plan's steps line)
 #
 # run from the project root:
 #   python evaluation/run_eval.py --label baseline
@@ -190,10 +192,18 @@ AMAZON_GAP = 90
 # endings that say nothing about the agent's decisions: the site blocked the
 # browser, setup failed before the agent started, the model API failed or hit
 # its limit, or a step hit its 30 s node timeout (a slow API, or a browser tab
-# that stopped answering, as in Amazon--0 in the 24 Oct smoke run).
+# that stopped answering, as in Amazon--0 in the 24 Oct smoke run), or Amazon
+# ran on a regional site (WRONG_SITE below).
 # after the planned tasks, each one that ended like this is run again (--retries
 # times at most), last so Amazon has had longest to forget the session
-RETRY_STATUSES = ("blocked", "setup_failed", "llm_failed", "rate_limited", "timed_out")
+RETRY_STATUSES = ("blocked", "setup_failed", "llm_failed", "rate_limited", "timed_out", "wrong_site")
+
+# Amazon can redirect to its local site (amazon.com.au) despite the US ZIP, and
+# the agent stays on a regional site by design (nodes.PLANNER_SYSTEM). the
+# references are amazon.com with a US address, so a run anywhere else isn't
+# valid: wrong_site, re-run (Amazon--12 in versionB_reruns, 31 Oct). the same
+# per-step check as the blocks below spots it
+WRONG_SITE = "amazon regional site"
 
 # pages that mean the site blocked the browser rather than the agent failing:
 # a task that hits one and doesn't finish is marked blocked, to re-run, not
@@ -202,6 +212,7 @@ _BLOCK_JS = """() => {
   const host = location.host, url = location.href;
   const text = document.body ? document.body.innerText : '';
   if (host.includes('amazon.')) {
+    if (!/(^|\\.)amazon\\.com$/.test(host)) return 'amazon regional site';
     if (text.includes('To continue, please click the') && text.includes('Continue shopping')) return 'amazon checkpoint';
     if (url.includes('validateCaptcha') || text.includes('Enter the characters you see below')) return 'amazon captcha';
     if (url.includes('/ap/signin') || url.includes('/ax/claim') || (text.includes('Sign in or create account') && !document.querySelector('#twotabsearchtextbox'))) return 'amazon sign-in';
@@ -304,6 +315,8 @@ def _tally(calls: list) -> dict:
 _screenshots: ContextVar[Path | None] = ContextVar("screenshots", default=None)
 # block pages the current task met, from the same per-step check
 _blocks: ContextVar[list | None] = ContextVar("blocks", default=None)
+# each plan step's full element-list length, step -> chars, for its steps line
+_dom_chars: ContextVar[dict | None] = ContextVar("dom_chars", default=None)
 _node_plan = nodes.node_plan
 
 
@@ -322,7 +335,22 @@ async def _plan_with_screenshot(state, config):
                 BROWSER_CHECK_TIMEOUT)
         except Exception as e:
             print(f"  (screenshot failed: {e!r})")
-    return await _node_plan(state, config)
+    update = await _node_plan(state, config)
+    # the element list node_plan just read (cached), in full: whether the part
+    # past nodes.DOM_LIMIT held what the agent needed (Amazon--16's size
+    # buttons, 1 Nov smoke run)
+    dom_chars = _dom_chars.get()
+    if folder is not None and dom_chars is not None:
+        step = update.get("step", 0)
+        try:
+            summary = await asyncio.wait_for(session.get_browser_state_summary(cached=True),
+                                             BROWSER_CHECK_TIMEOUT)
+            dom = summary.dom_state.llm_representation()
+            (folder / f"step{step:02d}_dom.txt").write_text(dom)
+            dom_chars[step] = len(dom)
+        except Exception as e:
+            print(f"  (element list not saved: {e!r})")
+    return update
 
 
 nodes.node_plan = _plan_with_screenshot
@@ -338,8 +366,10 @@ def _describe(node: str, update: dict | None) -> dict:
     if node == "plan":
         d = update["last_decision"]
         # a revised plan is in the action as `revised_plan`; "plan" says it was taken
+        chars = (_dom_chars.get() or {}).get(update.get("step"))
         return {"step": update.get("step"), "action": d.model_dump(exclude_none=True, exclude={"reasoning"}),
-                "reasoning": d.reasoning} | ({"plan": update["plan"]} if "plan" in update else {})
+                "reasoning": d.reasoning} | ({"plan": update["plan"]} if "plan" in update else {}) | (
+            {"dom_chars": chars, "dom_cut": chars > nodes.DOM_LIMIT} if chars is not None else {})
     if node == "analyse":
         if "last_decision" in update:  # a loop guard swapped in a stop
             return {"verdict": "forced_stop", "action": update["last_decision"].model_dump(exclude_none=True)}
@@ -389,7 +419,17 @@ def _ending_note(r: dict) -> str:
         return f"the model API failed ({r['status']}), not the agent: re-run, don't score"
     if r["status"] == "timed_out":
         return f"a step timed out ({r['error']}), not the agent's decision: re-run, don't score"
+    if r["status"] == "wrong_site":
+        first = next(b for b in r["blocked"] if b["kind"] == WRONG_SITE)
+        return f"ran on {first['url'][:60]} (step {first['step']}), not amazon.com: re-run, don't score"
     if r["status"] == "gave_up":
+        if r["blocked"]:
+            first = r["blocked"][0]
+            return (f"gave up with its own answer after a sign-in page (step {first['step']}): score it "
+                    f"if the sign-in only hid content, re-run if it was a wall over the whole site")
+        if nodes.UNCONFIRMED_NOTE in (r["answer"] or ""):
+            return ("a loop guard stopped it, and it gave the answer the checking step had turned "
+                    "down (analyse's reason in steps.jsonl): review it")
         if _needs_review(r["status"], r["answer"]):
             return "gave up with its own answer: review it (it can be right, e.g. nothing meets the conditions)"
         return "status gave_up: stopped with a stock message, no answer"
@@ -411,6 +451,7 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
     shots_token = _screenshots.set(shots)
     blocks: list = []
     blocks_token = _blocks.set(blocks)
+    dom_token = _dom_chars.set({})
     llm_errors: list = []
     llm_errors_token = _llm_errors.set(llm_errors)
     session = None  # stays None if the browser fails to start
@@ -451,6 +492,10 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
                 setup_error = await _set_us_delivery(session, task["web"])
                 if setup_error:
                     print(f"  ({setup_error}; running with the IP's region)")
+                # don't spend a run on a regional site: it wouldn't count
+                block = await _block(session)
+                if block and block["kind"] == WRONG_SITE:
+                    raise RuntimeError(f"opened {block['url'][:80]}, not amazon.com")
         except Exception as e:
             setup_error = repr(e)
             raise _SetupFailed from e
@@ -496,6 +541,7 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         _usage.reset(token)
         _screenshots.reset(shots_token)
         _blocks.reset(blocks_token)
+        _dom_chars.reset(dom_token)
         _llm_errors.reset(llm_errors_token)
         if session is not None:
             block = await _block(session)
@@ -519,7 +565,16 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
     # block either way
     if answer == nodes.BOT_CHECK_MESSAGE and not blocks:
         blocks.append({"step": "agent", "kind": "bot check (agent stopped)", "url": ""})
-    if blocks and status != "ok":
+    # the check can't tell Amazon's sign-in wall from a sign-in page the agent
+    # opened itself for content that needs one (/product-reviews/), and Amazon--12
+    # r2 in version B was marked blocked for the second while it gave up with a
+    # scoreable answer (31 Oct). a gave_up with its own answer whose only blocks
+    # are sign-in pages is reviewed instead, with a note to decide which it was
+    signin_answered = (status == "gave_up" and _needs_review(status, answer)
+                       and all(b["kind"] == "amazon sign-in" for b in blocks))
+    if any(b["kind"] == WRONG_SITE for b in blocks):
+        status = "wrong_site"
+    elif blocks and status != "ok" and not signin_answered:
         status = "blocked"
     return {
         "task_id": task["id"], "repeat": repeat, "attempt": attempt, "web_name": task["web_name"],

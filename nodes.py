@@ -94,6 +94,14 @@ MAKE_PLAN_SYSTEM = SystemMessage(content=(
     "result.\n"
     "- Plan only from the request. Don't guess facts, prices or how a site is "
     "laid out: the assistant reads each page as it goes.\n"
+    # the planner follows the plan's words: in version B every Amazon--3 plan
+    # said "climbing gear" for the task's "climbing gears" and every search used
+    # it, and an "open the deals section if needed" step took all three
+    # Amazon--18 runs off the home page the task named (31 Oct)
+    "- Keep the user's own words. Search for exactly what they wrote, letter for "
+    "letter: 'climbing gears' stays 'climbing gears', not 'climbing gear'. A page "
+    "they name is where the answer comes from: for 'Open Amazon's home page and "
+    "tell me…', read the home page, and don't add a step that leaves it.\n"
     "- `summary`: one short sentence said aloud before the first step."
 ))
 
@@ -365,12 +373,21 @@ PLANNER_SYSTEM = SystemMessage(content=(
     "correct product and target THAT; if it says an overlay is blocking, dismiss "
     "the overlay. If after trying you genuinely cannot find what's needed on this "
     "page, choose done and honestly state what's missing — do NOT claim success.\n\n"
+    # all three max_steps runs in version B had a rejected done with an answer in
+    # it, then spent the rest of the steps without giving one (31 Oct)
+    "STEP BUDGET: the request shows 'Step N of M'. At step M the task stops, and "
+    "if you haven't chosen done by then the user gets no answer at all. On the "
+    "last 2 steps, choose done with the best answer you have, and say in `source` "
+    "what you couldn't confirm: an honest partial answer beats none. After a "
+    "rejection, if two steps haven't got you closer to what it asked for, do the "
+    "same rather than keep searching.\n\n"
     "THE PLAN: you may get a short plan for the task, written before you started. "
     "It's a guide, not a record: it says what was meant to happen, not what did. "
     "The page and the actions-taken list are the truth. If they differ from the "
     "plan, follow the page. Skip a step the page makes unnecessary, and never give "
     "an answer just to finish the plan: if nothing meets the task's conditions, "
-    "say so. If the latest entry in the actions-taken list is 'user said no: …', "
+    "say so. Where the plan rewords the request, the request wins: search for "
+    "the request's exact words, and answer from the page it names. If the latest entry in the actions-taken list is 'user said no: …', "
     "ALWAYS set `revised_plan`, even if only one step changes: the remaining steps, "
     "rewritten to follow their reason, so the user hears what changed. Otherwise "
     "set it ONLY when the plan no longer fits: a step failed or your proposal was "
@@ -405,6 +422,14 @@ _VERIFIER_FIND_RULE = (
     "done text names a site as its source but the agent never left Google (the "
     "current page is google.com and no click or navigate in the actions-taken list "
     "is 'now on' another site), REJECT and say to open that site's page.\n"
+    # Google Search--14 r1 in version B: the right club (the reference), rejected
+    # because the page didn't show the player retiring "the year before last".
+    # the agent searched for that until it ran out of steps (31 Oct)
+    "  • A PREMISE the task takes for granted (that the player retired the year "
+    "before last, that a film is the latest one) that no page confirmed is NOT a "
+    "reason to send the agent searching again. If what was asked is answered and "
+    "supported, APPROVE when the done text says that part is unconfirmed; if it "
+    "doesn't say so, REJECT only to ask for that doubt in `source`, then done again.\n"
 )
 
 VERIFIER_SYSTEM = SystemMessage(content=(
@@ -458,6 +483,10 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "sort the page offers). If the actions-taken list already shows a 'nothing "
     "qualifies' done rejected, APPROVE this one if it's honest. REJECT if it claims "
     "a check (a sort, a filter, pages) the actions-taken list doesn't show.\n"
+    "  • LAST STEPS: if the agent is on one of its last 2 steps ('Step N of M'), "
+    "a rejection ends the task with no answer at all. APPROVE an honest done there, "
+    "one that says in its text what's unconfirmed or missing; REJECT only a done "
+    "that's wrong or claims a check the actions-taken list doesn't show.\n"
     "  REJECT done only if none of these holds; then say what's still needed.\n\n"
     "When rejecting, give one concrete next step."
 ))
@@ -503,6 +532,19 @@ BAD_ACTION_MESSAGE = ("Sorry, I couldn't work out the next step, so I stopped. "
 BOT_CHECK_MESSAGE = ("Sorry, this site is asking me to prove I'm human. I don't get "
                      "past those checks myself, so I stopped. You can complete the "
                      "check on the page and ask me again.")
+# added to an answer the checking step turned down, when a loop guard stops the
+# task before the agent could fix it (_stuck_stop)
+UNCONFIRMED_NOTE = "I got stuck before I could finish checking this, so it may not be right."
+
+
+def _stuck_stop(scratch: list[dict], reasoning: str) -> "PlanDecision":
+    # a loop guard's stop. if the checking step turned down an answer earlier,
+    # the user gets that answer with UNCONFIRMED_NOTE rather than nothing: both
+    # stuck stops in the 1 Nov smoke run threw one away (Amazon--16 had free
+    # returns and how to return, rejected only for not selecting XX-Large)
+    answer = next((e["answer"] for e in reversed(scratch) if e.get("answer")), None)
+    text = f"{answer} {UNCONFIRMED_NOTE}" if answer else STUCK_MESSAGE
+    return PlanDecision(reasoning=reasoning, action="done", success=False, text=text)
 
 
 def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
@@ -578,6 +620,12 @@ def _extract_answer(content: str) -> str:
     # pushed past the limit by the wrapper
     m = re.search(r"<(structured_result|result)>\s*(.*?)\s*</\1>", content, re.S)
     return m.group(2) if m else content
+
+
+# how much of the page's element list the planner and the checking step read.
+# evaluation logs each page's full length (run_eval.py, dom_chars) to see how
+# often it cuts: Amazon--16's size buttons may be past it (1 Nov smoke run)
+DOM_LIMIT = 6000
 
 
 def _format_history(messages: list[dict], limit: int = 6) -> str:
@@ -669,7 +717,7 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     summary = await session.get_browser_state_summary()
     dom_text = summary.dom_state.llm_representation()
     # cap the DOM text so a huge page doesn't blow up tokens/cost in the MVP
-    dom_text = dom_text[:6000]
+    dom_text = dom_text[:DOM_LIMIT]
 
     history = _format_history(state.get("messages", [])[:-1])
     # actions taken THIS task — the within-task memory that stops oscillation
@@ -679,6 +727,7 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
         f"Current request: {state['query']}\n\n"
         f"{_format_plan(state.get('plan', []))}"
         f"{progress}"
+        f"Step {step} of {MAX_STEPS}\n\n"
         f"Current page: {summary.title} ({summary.url})\n\n"
         f"Interactive elements:\n{dom_text}"
     ))
@@ -705,11 +754,12 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
     return {"last_decision": decision, "step": step}
 
 async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
-                      progress: str, title: str, url: str) -> Verdict:
+                      progress: str, title: str, url: str, step: int) -> Verdict:
     # channel 1: judge the action from the TEXT DOM (same model as the planner)
     verify_msg = UserMessage(content=(
         f"Task: {query}\n\n"
         f"{progress}"
+        f"Step {step} of {MAX_STEPS}\n\n"
         f"Proposed action: {decision.action} "
         f"(url={decision.url}, index={decision.index}, text={decision.text})\n"
         f"Planner's reasoning: {decision.reasoning}\n\n"
@@ -756,7 +806,12 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # execute would turn it into a stop and end the task (Amazon--6, 30 Oct smoke
     # run: an extract with no `text` at step 2)
     missing = _missing_field(decision)
-    if decision.action not in ("click", "done") and not missing:
+    # a hint in the outcome after SCROLL_NUDGE scrolls didn't stop the planner
+    # scrolling for a button (Amazon--16, 1 Nov smoke run), and it does change
+    # course after a rejection, so the next scroll is rejected here
+    scroll_run = (decision.action == "scroll"
+                  and len(_scrolls_in_a_row(state.get("scratch", []))) >= SCROLL_NUDGE)
+    if decision.action not in ("click", "done") and not missing and not scroll_run:
         return Command(goto="approve")
     # the bot-check stop comes from code, not the model: nothing to verify
     if decision.action == "done" and decision.text == BOT_CHECK_MESSAGE:
@@ -816,12 +871,7 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
                     return Command(goto="approve", update={"last_decision": stop})
             last_reason = scratch[last_rej_idx].get("outcome", "the action was rejected repeatedly")
             print(f"  analyse → stop (same action rejected twice): {last_reason[:120]}")
-            stop = PlanDecision(
-                reasoning="stuck: the gate rejected the same action repeatedly",
-                action="done",
-                success=False,
-                text=STUCK_MESSAGE,
-            )
+            stop = _stuck_stop(scratch, "stuck: the gate rejected the same action repeatedly")
             return Command(goto="approve", update={"last_decision": stop})
 
     # a done with no text has no answer to give: execute would report the word
@@ -844,13 +894,20 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
         print(f"  analyse [✗] {decision.action}: no {field}")
         return _reject(state, rej_key, f"{decision.action} has no `{field}`: {fix}")
 
+    if scroll_run:
+        print("  analyse [✗] scroll: too many in a row")
+        return _reject(state, rej_key, (
+            f"{SCROLL_NUDGE} scrolls in a row haven't found it. Don't scroll again: extract "
+            f"what you're looking for off the page (extract reads the whole page, not just "
+            f"what's on screen), or choose done and say what's missing"))
+
     session, _, _ = _resources(config)
     summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
-    dom_text = summary.dom_state.llm_representation()[:6000]
+    dom_text = summary.dom_state.llm_representation()[:DOM_LIMIT]
     progress = _format_scratch(state.get("scratch", []))
 
     dom_v = await _verify_dom(decision, query, dom_text, progress,
-                              summary.title, summary.url)
+                              summary.title, summary.url, state.get("step", 0))
     # skip vision for done and for price tasks (saves ~2s per step, fewer overlay loops)
     skip_vision = decision.action == "done" or _price_shortcuts(query)
     vis_v = None if skip_vision else await _verify_vision(
@@ -872,14 +929,19 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
 
     if approved:
         return Command(goto="approve")
-    return _reject(state, rej_key, reason)
+    return _reject(state, rej_key, reason,
+                   answer=answer_text if decision.action == "done" else None)
 
 
 # typed like node_analyse's return: Command's type parameter is invariant, so a
 # narrower Literal here doesn't type-check where analyse returns it
-def _reject(state: PipelineState, rej_key: str, reason: str) -> Command[Literal["approve", "plan", "resolve"]]:
-    # send a rejected action back to the planner with the reason in scratch
+def _reject(state: PipelineState, rej_key: str, reason: str,
+            answer: str | None = None) -> Command[Literal["approve", "plan", "resolve"]]:
+    # send a rejected action back to the planner with the reason in scratch. a
+    # rejected done keeps its answer, for _stuck_stop
     entry = {"action": rej_key, "outcome": f"gate rejected: {reason}"}
+    if answer:
+        entry["answer"] = answer
     scratch = state.get("scratch", []) + [entry]
     # a rejection loops back to plan without passing resolve, which is what
     # enforces MAX_STEPS. so check it here: without this, a planner that keeps
@@ -1017,6 +1079,25 @@ async def node_approve(state: PipelineState, config: RunnableConfig) -> Command[
     })
 
 
+SCROLL_NUDGE = 3
+SCROLL_STOP = 6
+
+
+def _scrolls_in_a_row(scratch: list[dict]) -> list[bool]:
+    # the directions (True=down) of the scrolls at the end of the actions-taken
+    # list. rejections (string actions) are skipped: one between two scrolls
+    # doesn't mean the agent stopped scrolling
+    downs = []
+    for e in reversed(scratch):
+        action = e.get("action")
+        if isinstance(action, str):
+            continue
+        if not (isinstance(action, dict) and "scroll" in action):
+            break
+        downs.append(bool(action["scroll"].get("down", True)))
+    return downs[::-1]
+
+
 async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
     # run the action the planner chose. just browser-use's hands 
     session, tools, file_system = _resources(config)
@@ -1048,14 +1129,23 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
                 action_name = "done"
                 break
 
-    if action_name != "scroll" and repeats >= 2:
-        print(f"  ⚠ loop guard: '{action_name}' repeated {repeats + 1}×, stopping")
-        action = _decision_to_action(tools, PlanDecision(
-            reasoning="loop guard: same action repeated without progress",
-            action="done",
-            success=False,
-            text=STUCK_MESSAGE,
-        ))
+    # scroll is exempt from the guard above, so hunting for something by
+    # scrolling up and down could use up the task: Amazon--16 r2 in version B
+    # scrolled 10 times for a size selector after a rejection (31 Oct). from
+    # SCROLL_NUDGE scrolls in a row the outcome says to extract instead; at
+    # SCROLL_STOP, scrolling both ways, it's spinning. paging one way is fine
+    scrolls = _scrolls_in_a_row(state.get("scratch", []))
+    if action_name == "scroll":
+        scrolls.append(bool(action_dump["scroll"].get("down", True)))
+    else:
+        scrolls = []
+    spinning = len(scrolls) >= SCROLL_STOP and len(set(scrolls)) == 2
+
+    if (action_name != "scroll" and repeats >= 2) or spinning:
+        what = f"scroll up and down {len(scrolls)}×" if spinning else f"'{action_name}' repeated {repeats + 1}×"
+        print(f"  ⚠ loop guard: {what}, stopping")
+        action = _decision_to_action(tools, _stuck_stop(
+            state.get("scratch", []), "loop guard: same action repeated without progress"))
         action_dump = action.model_dump(exclude_unset=True)
         action_name = next(iter(action_dump), "")
 
@@ -1088,6 +1178,10 @@ async def node_execute(state: PipelineState, config: RunnableConfig) -> dict[str
             # (Google Search--7, 24 Oct smoke run). the host is short, so it goes
             # after the cut and always survives it
             landed = f" -> now on {urlparse(after.url).netloc or after.url}"
+        elif action_name == "scroll" and len(scrolls) >= SCROLL_NUDGE:
+            # after the cut, like landed, so the nudge always survives it
+            landed = (f" ({len(scrolls)} scrolls in a row: extract what you're looking for "
+                      f"off the page instead, or choose done and say what's missing)")
     entry = {"action": action_dump, "outcome": _cut(str(outcome), limit - len(landed)) + landed}
     scratch = state.get("scratch", []) + [entry]
     return {"last_result": result, "done": done, "scratch": scratch}

@@ -33,7 +33,12 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   answer is left blank, to review like an `ok` one. it can be right: when no
   product meets the task's conditions any more, "none of them qualify", backed
   by screenshots, is the correct answer (see Amazon below). it's a 0 if the
-  screenshots show it just didn't manage the task.
+  screenshots show it just didn't manage the task. since 1 Nov, when a loop
+  guard stops the agent after the checking step turned down an answer, it
+  gives that answer, ending "I got stuck before I could finish checking this,
+  so it may not be right." judge it like any other: the main answer has to be
+  right and meet every condition, and the checking step's reason (the
+  `analyse` line in `steps.jsonl`) says what it doubted.
 - **blocked**: a task with status `blocked` hit a captcha, checkpoint or
   sign-in wall and didn't finish (see below). since 24 Oct the agent stops at
   a bot check itself ("Sorry, this site is asking me to prove I'm human…")
@@ -57,7 +62,7 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   left blank like the others. different from `harness_timeout`, the 600 s cap
   on the whole task, which is a 0: the agent was still going.
 - **retries**: after the planned tasks, every task that ended `blocked`,
-  `setup_failed`, `llm_failed`, `rate_limited` or `timed_out` is run once more, Amazon gap
+  `setup_failed`, `llm_failed`, `rate_limited`, `timed_out` or `wrong_site` is run once more, Amazon gap
   included (`--retries N` for more, `--retries 0` for none). `tasks.jsonl` keeps
   every attempt, with an `attempt` field (0 is the planned run); `summary.csv`
   has the last attempt only, and its `notes` say when a task was retried. a
@@ -84,7 +89,9 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   premiere or the 5 May 2023 US release (the reference). an answer that leads
   with the premiere but explains the difference properly is a 1, an exception
   to the main-answer rule; it's a 0 only if the information is wrong. write
-  "ambiguous: led with the premiere" in `notes` when it does.
+  "ambiguous: led with the premiere" in `notes` when it does. the same goes for
+  an answer that leads with another country's earlier release and gives the US
+  date as well (e.g. 3 May 2023 in the UK, versionB r0).
   an answer taken from Google's AI Overview is judged on whether it's right,
   as long as it says so: the source has to say it came from the Overview and
   wasn't confirmed on a source page. the source cards and chips inside the
@@ -106,7 +113,10 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   the source sentence has to say truthfully what was checked: if it names a
   sort, filter or page the screenshots don't show, it's a 0, even when the
   conclusion is right (for a user who can't see the screen, a search that
-  didn't happen is as bad as a wrong product). (e.g. Amazon--6: the reference
+  didn't happen is as bad as a wrong product). being truthful isn't enough on
+  its own, though: one page of a Featured list is too little to back "none",
+  even when the answer says that's all it read (Amazon--6 versionB r0 and r1,
+  16 of about 600 results; r2, which read 3 pages, is a 1). (e.g. Amazon--6: the reference
   stroller had 22,146 reviews; in October 2026 it has about 5.8K, and no black
   stroller at $100–200 has over 20,000. Amazon no longer offers a sort by
   number of reviews, at least without an account: `s=review-count-rank` in a
@@ -116,13 +126,22 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   rewording it changes the results, so the answer is to a different task and
   is a 0. (e.g. Amazon--3, "climbing gears": a search for "climbing gear"
   returns different first results, versionA r2.)
+  Amazon--33 ("a portable air conditioner … suitable for a room size of 300 sq
+  ft, with energy efficiency rating, and compare the prices of the top three
+  search results") is read the same way: "energy efficiency" is part of what to
+  search for, so a search without it is a 0 (versionB r0). the task is the
+  price comparison, so an answer that says truthfully the three listings
+  don't show a rating is fine; it doesn't have to open each product page.
   Amazon--30 ("the highest-rated fiction book released in 2024, with a
   minimum of 50 customer reviews") has no single right answer: taken
   literally it's a little-known 4.9-star book, while the reference reads it as
   a popular novel. so it's judged on how the agent searched, on Amazon. it's a 1
   only if the screenshots show it (1) limited the search to fiction with
   Amazon's own category (Books › Literature & Fiction), not by judging titles,
-  (2) limited it to 2024 releases, (3) sorted by customer rating or used an
+  (2) kept to 2024 releases: Amazon has no filter by year (only "Last 30/90
+  days"), so a "2024" in the search counts, as long as the answer's title shows
+  a 2024 date and earlier titles on the list were skipped, not answered,
+  (3) sorted by customer rating or used an
   Amazon top-rated or best-seller list for 2024 fiction, and (4) answered with
   the top title on that list with at least 50 reviews. finding the book through
   another site, such as Google, is a 0.
@@ -137,7 +156,18 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   without saying so. this is different from **blocked** (below): a captcha,
   checkpoint or sign-in wall that covers the whole site because Amazon or
   Google took the browser for a bot. those are re-run, not scored. say which
-  in `notes`.
+  in `notes`. the runner can't tell the two apart from the page. since 1 Nov,
+  a `gave_up` with its own answer whose only blocks were sign-in pages is left
+  blank to review, with a note saying so: score it if the agent reached the
+  sign-in itself for hidden content (e.g. by opening `/product-reviews/`) and
+  answered as above, re-run it if it was a wall. before that these were marked
+  `blocked` (Amazon--12 versionB r2, scored by hand).
+- **another Amazon site**: Amazon sometimes redirects to its local site
+  (amazon.com.au) despite the US ZIP. a run on any site other than amazon.com
+  isn't valid: leave `success` blank and re-run it (Amazon--12 in
+  `versionB_reruns`). since 1 Nov the runner checks the site after setting the
+  ZIP (a `setup_failed` if it's wrong) and before every step: a task that
+  reached another Amazon site ends `wrong_site`, is retried, and is left blank.
 - **notes**: one line on why, for every 0 and for any judgement call.
 
 if two people are available, have both score the same few runs independently
