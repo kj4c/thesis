@@ -1,0 +1,44 @@
+{
+  "items": [
+    {
+      "id": "1a5b790b-6540-43de-9a57-a4566a83f382",
+      "prompt": "Please add this to my calendar",
+      "media_type": "image",
+      "media_path": "/Users/khyejaclow/Developer/thesis/browser_use/glasses_media/5b585876-107a-4a26-be61-dc885423a8c7.jpg",
+      "received_at": "2026-10-24T17:28:33.539533",
+      "status": "acted"
+    },
+    {
+      "id": "89d59842-2bbd-48e0-bdc7-04064152f699",
+      "prompt": "Please add this event to my Google calendar",
+      "media_type": "image",
+      "media_path": "/Users/khyejaclow/Developer/thesis/browser_use/glasses_media/8e25acac-960c-4ebd-bcbb-a9abaf8e83f3.jpg",
+      "received_at": "2026-10-24T17:33:51.727885",
+      "status": "acted"
+    },
+    {
+      "id": "45702146-ee1d-443f-ab2b-0c62585207ee",
+      "prompt": "And so I can see it happening over here",
+      "media_type": "unknown",
+      "media_path": "",
+      "received_at": "2026-10-24T17:34:22.687994",
+      "status": "dismissed"
+    },
+    {
+      "id": "e4dee849-e862-42af-90bd-f8d3321719da",
+      "prompt": "No can you",
+      "media_type": "unknown",
+      "media_path": "",
+      "received_at": "2026-10-24T17:34:41.330603",
+      "status": "dismissed"
+    },
+    {
+      "id": "f86e125b-e089-4634-a2fd-3aef59b344a9",
+      "prompt": "Can you change the time to 8 PM instead",
+      "media_type": "unknown",
+      "media_path": "",
+      "received_at": "2026-10-24T17:34:53.925402",
+      "status": "acted"
+    }
+  ]
+}
