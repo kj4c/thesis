@@ -141,6 +141,7 @@ def build_agent():
     # blocked in a later version, so they're listed here
     serde = JsonPlusSerializer(allowed_msgpack_modules=[
         ("nodes", "PlanDecision"),
+        ("nodes", "VisionPlanDecision"),
         ("browser_use.agent.views", "ActionResult"),
     ])
     return g.compile(checkpointer=InMemorySaver(serde=serde))
