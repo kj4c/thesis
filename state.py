@@ -53,6 +53,9 @@ class PipelineState(TypedDict, total=False):
     # forever)
     # different from `messages`, which is the cross-turn chat memory.
     scratch: list[dict]
+    # vision only: what the planner has read so far this task (VisionPlanDecision.notes),
+    # since it sees only the current screenshot. cleared with scratch
+    notes: str
 
     # the task's plan: a few plain-language steps the user sees before the
     # first step (set by make_plan, revised by plan when a step fails or is

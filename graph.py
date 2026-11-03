@@ -86,6 +86,7 @@ async def default_error_handler(state: PipelineState, error: NodeError) -> Comma
         "step": 0,
         "done": False,
         "scratch": [],
+        "notes": "",
     })
 
 

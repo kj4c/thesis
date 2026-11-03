@@ -287,6 +287,14 @@ class VisionPlanDecision(PlanDecision):
     pages: float | None = Field(default=None, description=f"for scroll: how far, in screens: {SCROLL_PAGES} "
                                 f"(the default) = half a screen, so the next screenshot overlaps this one; "
                                 f"1 = a full screen, to page on through something you've already read")
+    # vision only sees just the current screenshot and has no extract, so what it
+    # read a scroll ago was gone: it scrolled back and forth between IMDb's top 3
+    # and entries 4–5 until the scroll stop (Google Search--3, both 3 Nov pilot2
+    # runs; Amazon--6 likewise). node_plan shows the notes again next step
+    notes: str | None = Field(default=None, description="what you've read so far that the task needs, "
+                              "since you won't see earlier screenshots again: the whole list each time, "
+                              "with what this screenshot adds, e.g. '1. Life Is Beautiful 8.6; 2. Back to "
+                              "the Future 8.5'. Empty if nothing to keep yet")
 
     # junk or out of range -> the default
     @field_validator("pages", mode="before")
@@ -297,6 +305,13 @@ class VisionPlanDecision(PlanDecision):
         except (TypeError, ValueError):
             return None
         return v if 0.25 <= v <= 1 else None
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _clean_notes(cls, v):
+        if isinstance(v, str) and v.strip().lower() in _PLACEHOLDERS:
+            return None
+        return v
 
 
 PLAN_SCHEMA = VisionPlanDecision if PERCEPTION == "vision" else PlanDecision
@@ -385,10 +400,14 @@ _PERCEPTION_RULES = {
         "is NOT available: read what you need off the screenshot, and scroll to see "
         "more of the page. A scroll moves half a screen unless you set `pages` to 1, "
         "so something cut off at the edge shows whole after one scroll.\n\n"
+        "You never see earlier screenshots again: whatever you read that the task "
+        "needs goes in `notes`, and you get your notes back each step. Before "
+        "scrolling back to something, check your notes: if it's there, don't.\n\n"
         "After a click, the outcome names the element that was actually clicked. If "
         "it isn't the one you meant, that number belongs to something else: don't "
         "click it again. Pick the box drawn on the element itself, or another way "
-        "to it.\n\n"
+        "to it. If the outcome says the element isn't available, that number isn't "
+        "on the page: don't use it again, take one from this screenshot's boxes.\n\n"
         + ("You get TWO screenshots of the same view: the first clean, the second with "
            "the numbered boxes. Read text and numbers from the clean one, since the "
            "labels can cover text; take the [index] values from the numbered one.\n\n"
@@ -888,7 +907,8 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
         f"Current request: {state['query']}\n\n"
         f"{_format_plan(state.get('plan', []))}"
         f"{progress}"
-        f"Step {step} of {MAX_STEPS}\n\n"
+        + (f"Your notes so far: {state.get('notes') or '(none yet)'}\n\n" if PERCEPTION == "vision" else "")
+        + f"Step {step} of {MAX_STEPS}\n\n"
         f"Current page: {summary.title} ({summary.url})\n\n"
     )
     # what the planner sees of the page, by PERCEPTION (#4): the element list,
@@ -928,12 +948,16 @@ async def node_plan(state: PipelineState, config: RunnableConfig) -> dict[str, A
         decision.text = spoken or None
 
     print(f"  [{step}] plan → {decision.action}")
+    update: dict[str, Any] = {"last_decision": decision, "step": step}
+    # a step with no notes keeps the last ones
+    if isinstance(decision, VisionPlanDecision) and decision.notes:
+        update["notes"] = decision.notes.strip()
     # a price task has no plan to revise
     if decision.revised_plan and state.get("plan"):
         new_plan = " | ".join(decision.revised_plan)
         print(f"  [{step}] plan → new plan: {new_plan}")
-        return {"last_decision": decision, "step": step, "plan": decision.revised_plan}
-    return {"last_decision": decision, "step": step}
+        update["plan"] = decision.revised_plan
+    return update
 
 async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
                       progress: str, title: str, url: str, step: int) -> Verdict:
@@ -1115,6 +1139,11 @@ async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[
     # (the call failed) lets the action through, as no verifier would
     if PERCEPTION == "vision":
         clean, shot = await _screenshots(summary)
+        # a done can rest on screenshots this one doesn't show, so the
+        # verifier gets what the planner read on them
+        notes = getattr(decision, "notes", None) or state.get("notes")
+        if notes:
+            progress += f"The planner's notes from earlier screenshots: {notes}\n\n"
         vis_v = await _verify_vision(decision, query, progress, shot,
                                      step=state.get("step", 0), clean=clean)
         if vis_v is None or vis_v.approved:
@@ -1294,7 +1323,7 @@ async def node_approve(state: PipelineState, config: RunnableConfig) -> Command[
     message = STOPPED_MESSAGE if choice == "stop" else DENIED_MESSAGE
     return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
         "messages": [{"role": "assistant", "content": message}],
-        "step": 0, "done": False, "scratch": [], "status": "stopped",
+        "step": 0, "done": False, "scratch": [], "notes": "", "status": "stopped",
     })
 
 
@@ -1427,7 +1456,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
             print(f"  done (early): {answer}")
             return Command(goto=END, update={  # pyright: ignore[reportReturnType]  (END is typed as str)
                 "messages": [{"role": "assistant", "content": answer}],
-                "step": 0, "done": False, "scratch": [], "status": "ok",
+                "step": 0, "done": False, "scratch": [], "notes": "", "status": "ok",
             })
 
     if finished:
@@ -1447,6 +1476,7 @@ async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__
             "step": 0,
             "done": False,
             "scratch": [],  # clear the within-task memory for the next task
+            "notes": "",
             "status": _finish_status(state.get("done", False), result),
         })
 
