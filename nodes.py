@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from PIL import Image
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from langgraph.graph import END
 from langgraph.types import Command, interrupt
 from langchain_core.runnables import RunnableConfig
@@ -198,6 +198,27 @@ class PlanDecision(BaseModel):
                                            "failed step, a rejected proposal or 'user said no': the new plan, "
                                            "the remaining steps in the same plain style. Otherwise leave it empty")
     success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
+
+    # the tool is offered, not forced (thinking is on), so nothing makes the model
+    # send every field, and at done it often sends only `answer` and `source`:
+    # 8 of 9 done replies on Google Search--19 (3 Nov), and the same draw comes
+    # back when asked again. the earlier `{text}`-only replies (versions B, C) were
+    # done answers too, and one was a lone `{url}`. so the action is read off what
+    # was sent; anything else (e.g. `{}`) still fails and is asked again
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_action(cls, v):
+        if not isinstance(v, dict) or v.get("action"):
+            return v
+        def sent(k):
+            return isinstance(v.get(k), str) and v[k].strip().lower() not in _PLACEHOLDERS
+        if sent("answer") or sent("source"):
+            action, reasoning = "done", "the answer is ready"
+        elif sent("url") and len(v) == 1:
+            action, reasoning = "navigate", "open the page"
+        else:
+            return v
+        return {**v, "action": action, "reasoning": v.get("reasoning") if sent("reasoning") else reasoning}
 
     # Claude's structured output fills not-applicable optional fields with JUNK
     # placeholders ("", "<UNKNOWN>", "null", "N/A", …) instead of omitting them,
