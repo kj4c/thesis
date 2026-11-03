@@ -1,0 +1,9 @@
+{
+  "input_method": "text",
+  "shortcut": "Ctrl+Return",
+  "permission_frequency": "every_step",
+  "glasses_port": 8765,
+  "glasses_autostart": false,
+  "glasses_device": null,
+  "calendar_client_file": "/Users/khyejaclow/Developer/thesis/browser_use/client_secret_425375565629-6ss6c3bdlu07fvq3s4ocmjqebgagded3.apps.googleusercontent.com.json"
+}

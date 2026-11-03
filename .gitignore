@@ -2,6 +2,8 @@
 .env
 .env.local
 .env.*.local
+credentials.json
+token.json
 
 # Python
 __pycache__/
@@ -17,3 +19,6 @@ env/
 .idea/
 .vscode/
 .DS_Store
+
+# Folders
+archived/

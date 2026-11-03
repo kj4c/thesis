@@ -1,0 +1,693 @@
+# the graph nodes — respond, plan, analyse, execute, resolve — plus the schemas
+# and prompts they use. also keeps the original design stubs (superseded by the
+# node_* functions below, but left in as the design sketch).
+
+from typing import Literal, Any
+import re
+
+from pydantic import BaseModel, Field, field_validator
+from langgraph.graph import END
+from langgraph.types import Command
+from langchain_core.runnables import RunnableConfig
+
+from browser_use import Tools, ActionResult
+from browser_use.browser.python_highlights import create_highlighted_screenshot_async
+from browser_use.llm.messages import (
+    SystemMessage, UserMessage, ContentPartTextParam, ContentPartImageParam, ImageURL,
+)
+
+from llm import USE_VISION, make_planner_llm, make_vision_llm, make_extraction_llm, _ainvoke_with_retry
+from state import PipelineState, MAX_STEPS, _resources
+from reply_format import compact_glasses_reply, is_price_task, price_from_text
+
+# ── Node 1: Conversational Node  ─────────────────────────────────────────────
+'''
+    This one is for questions like 'what is on this page' and 'where is the
+    search bar'? May include an option to ask user if they want to switch to
+    'executive mode' if it sounds like they want a specific task done.
+
+    Potentially can be reused to judge what went wrong for a task after human
+    approval is denied.
+'''
+async def respond(query: str) -> str:
+    ... # TODO
+
+def is_task(query: str) -> bool:
+    # either LLM or action, depending on how we implement it
+    ... # TODO
+
+# ── Node 2: plan ──────────────────────────────────────────────---------------
+'''
+    As I see it, this is for collecting the vision-based coord mapping &
+    text-only DOM for the next node by just hitting both AI with the OG query
+    (and potentially the plan, or even information from the database to catch
+    disruptions, e.g. popus, 404s). Its main point is to notice if there's a
+    disruption and verify that the AI are mostly in agreement, or close to.
+
+    Might split the node into one for VBC & one for DOM (AKA one for each AI).
+
+    RE: plan/database as arguments, may be good to add for context, but we
+    then have to figure the function overload, shape of the query & how to
+    format either option.
+
+    RE: verification, may create an extra node or cut it out and double down
+    in next node instead of verifying within this node.
+
+'''
+async def plan(query: str) -> str:
+    ... # TODO
+
+# ── Node 3: analyse ──────────────────────────────────────────────────────────
+'''
+    Takes query and updated response to query (or specific step, still not
+    clear on that detail), confirms (re-verifies) consensus and checks if
+    approval is needed (based on user preference and verification result).
+
+    Assume we choose 1 of the two AI for this node.
+'''
+async def analyse(query: str, perception_data: str) -> str:
+    ... # TODO
+
+def ask_approval(question: str) -> bool:
+    # user input
+    ... # TODO
+
+# ── Node 4: execute ──────────────────────────────────────────────────────────
+'''
+    Self-explanatory, no AI, just browser control and a defined error class.
+
+    Might just be a function instead, need to revisit what defines a node.
+'''
+async def execute(query: str, perception_data: str) -> str:
+    ... # TODO
+
+# ── Node 5: resolve ──────────────────────────────────────────────────────────
+'''
+    Primarily saving information to the database and training data. Might need
+    AI to intuit what it should save? I don't know about that.
+
+    Also, depending on how the edges work, this node may define if the
+    graph goes to END now.
+'''
+async def resolve(query: str, success: str) -> str:
+    ... # TODO
+
+# ── LangGraph workflow ───────────────────────────────────────────────────────
+
+# what node_respond returns: is this a task to run in the browser, or a question
+# we can just answer directly? (the conversational front-desk decision.)
+class RespondDecision(BaseModel):
+    kind: Literal["task", "answer"] = Field(description="task = do something in the browser; answer = reply directly")
+    answer: str | None = Field(default=None, description="when kind=answer: the reply to give the user")
+    reasoning: str = Field(description="one sentence: why it's a task or an answer")
+
+
+RESPOND_SYSTEM = SystemMessage(content=(
+    "You are the front desk of a browser assistant for smart glasses. The user "
+    "hears your reply spoken aloud — keep it SHORT.\n"
+    "- kind='task' if they want you to DO something in the browser: search, find a "
+    "price, navigate, click, buy, etc. ALWAYS use task for price/cost/find/on Amazon "
+    "requests — never try to answer those yourself from a stale page.\n"
+    "- kind='answer' ONLY for quick factual questions already fully answered on the "
+    "current page. Put the reply in `answer` — ONE short sentence max, no preamble.\n"
+    "When in doubt, prefer task."
+))
+
+
+async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[Literal["plan", "__end__"]]:
+    # the front desk: is this a task to run in the browser, or a question we can
+    # just answer? tasks go to plan; answers we reply to and end the turn. this
+    # is also the conversational mode (e.g. "what's on this page")
+    session, _, _ = _resources(config)
+    vision_llm = make_vision_llm()
+    summary = await session.get_browser_state_summary(include_screenshot=vision_llm is not None)
+    dom_text = summary.dom_state.llm_representation()[:4000]
+
+    history = _format_history(state.get("messages", [])[:-1])
+    text = (
+        f"{history}"
+        f"User: {state['query']}\n\n"
+        f"Current page: {summary.title} ({summary.url})\n\n"
+        f"Interactive elements:\n{dom_text}"
+    )
+
+    decision: RespondDecision | None = None
+    if vision_llm and summary.screenshot:
+        try:
+            response = await _ainvoke_with_retry(
+                vision_llm, [RESPOND_SYSTEM, _with_image(text, summary.screenshot)], RespondDecision,
+            )
+            decision = response.completion
+        except Exception as e:
+            print(f"  (vision respond failed, using text: {type(e).__name__}: {str(e)[:80]})")
+    if decision is None:
+        response = await _ainvoke_with_retry(
+            make_planner_llm(), [RESPOND_SYSTEM, UserMessage(content=text)], RespondDecision,
+        )
+        decision = response.completion
+
+    if decision.kind == "task":
+        print(f"  respond → task")
+        return Command(goto="plan")
+
+    # a question / chat — answer it and go back to listening
+    answer = decision.answer or "(no answer)"
+    print(f"  respond → {answer[:120]}{'…' if len(answer) > 120 else ''}")
+    return Command(goto=END, update={"messages": [{"role": "assistant", "content": answer}]})
+
+# what the planner has to return: exactly one next action. kept deliberately
+# small (6 actions) so the schema + prompt stay readable for the MVP; production
+# would reuse browser-use's full AgentOutput schema
+class PlanDecision(BaseModel):
+    reasoning: str = Field(description="one sentence: why this action moves the task forward")
+    action: Literal["navigate", "click", "input", "scroll", "extract", "done"]
+    url: str | None = Field(default=None, description="for navigate: the URL to open")
+    index: int | None = Field(default=None, description="for click/input: the [index] of the element")
+    text: str | None = Field(default=None, description="for input: text to type; for extract: what info to read off the page; for done: the answer — for prices use ONLY e.g. '$54.99'")
+    down: bool | None = Field(default=None, description="for scroll: true=down, false=up")
+    success: bool = Field(default=True, description="for done ONLY: true if the task genuinely succeeded; false if you are stopping WITHOUT completing it (couldn't find it, gave up, blocked). Be honest — never claim success for a task you did not complete.")
+
+    # Claude's structured output fills not-applicable optional fields with JUNK
+    # placeholders ("", "<UNKNOWN>", "null", "N/A", …) instead of omitting them,
+    # which crashes int/bool parsing. Coerce BY TYPE (not by enumerating sentinels,
+    # which is whack-a-mole): anything that isn't a real int/bool becomes None.
+    @field_validator("index", mode="before")
+    @classmethod
+    def _clean_index(cls, v):
+        if isinstance(v, bool) or v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None  # "", "<UNKNOWN>", "null", etc.
+
+    @field_validator("down", mode="before")
+    @classmethod
+    def _clean_down(cls, v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("true", "1", "yes", "down"):
+            return True
+        if s in ("false", "0", "no", "up"):
+            return False
+        return None  # anything else -> unset
+
+    @field_validator("url", "text", mode="before")
+    @classmethod
+    def _clean_optional_str(cls, v):
+        if isinstance(v, str) and v.strip().lower() in (
+            "", "null", "none", "n/a", "na", "unknown", "<unknown>", "undefined",
+        ):
+            return None
+        return v
+
+    # success is a plain bool (not optional); junk/blank -> default True
+    @field_validator("success", mode="before")
+    @classmethod
+    def _clean_success(cls, v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("false", "0", "no"):
+            return False
+        return True
+
+
+PLANNER_SYSTEM = SystemMessage(content=(
+    "You are the planner for a browser automation agent. Each turn you get the "
+    "user's task and the current page's interactive elements, each tagged with a "
+    "[index]. Choose the SINGLE next action that best progresses the task.\n\n"
+    "You MUST fill the fields the chosen action requires — an action with a "
+    "missing field is invalid and wastes a step:\n"
+    "- navigate: set `url` to a FULL url. ONLY navigate to a url the user gave "
+    "you or a well-known site (e.g. https://www.google.com, https://www.amazon.com). "
+    "NEVER invent or guess a shop/product url — made-up domains fail to resolve.\n"
+    "- click: set `index` to an element's [index] from the list below.\n"
+    "- input: set `index` AND `text`.\n"
+    "- scroll: set `down` (true=down, false=up).\n"
+    "- extract: read the CURRENT page for a fact — set `text` to what you want "
+    "(e.g. 'cheapest spoon price and product name'). Use this instead of scrolling "
+    "around to hunt for information.\n"
+    "- done: set `text` to the final answer. For PRICE tasks: ONLY `$54.99` or "
+    "`$54.99 (different brand)` if the listing isn't the same brand as the user's "
+    "photo. One line max — no extra commentary.\n\n"
+    "PRICE / FIND TASKS — be fast (3–4 steps max):\n"
+    "- On search results: ONE extract for the first listed price, then done. STOP.\n"
+    "- Do NOT click into product pages, re-extract, or scroll for price-only tasks.\n"
+    "- If the first result is a different brand, still done with `$price (different brand)` "
+    "— do NOT keep searching.\n"
+    "- If actions-taken already shows an extract with a $ price, choose done immediately.\n\n"
+    "SEARCHING THE WEB — Google is the default. To find or look something up, "
+    "navigate DIRECTLY to a Google search URL in one step: "
+    "https://www.google.com/search?q=<your+query+with+plus+signs>. Don't go to "
+    "google.com and type — just navigate straight to the search URL.\n\n"
+    "ANSWERING 'FIND / WHAT IS' QUERIES EFFICIENTLY: after the Google search loads, "
+    "the answer is usually right there — in the AI Overview box or the shopping/"
+    "result snippets. Use `extract` to read it, then `done`. Do NOT click through "
+    "into individual shops or scroll repeatedly unless the answer truly isn't on "
+    "the results page. (Clicking into a store is only needed to DO something there, "
+    "like add to cart — not just to read a price.)\n\n"
+    "Only navigate to a url the user gave you or a well-known site — NEVER invent a "
+    "shop/product url. If a navigation FAILS (can't resolve), don't retry it — go "
+    "to a Google search URL instead.\n\n"
+    "POPUPS / OVERLAYS come FIRST. Cookie-consent, privacy, newsletter, region, or "
+    "app-install banners sit on top of the page and block everything underneath — "
+    "clicks on elements below them silently fail or time out. If the elements list "
+    "has anything like 'Accept', 'Accept all', 'Reject', 'I agree', 'Continue', "
+    "'Got it', 'Close', 'No thanks', or '×', DISMISS IT before doing anything else. "
+    "Signs you're blocked by an overlay: your last click errored/timed out, or the "
+    "button you want isn't clickable even though you can see it. In that case, look "
+    "for a consent/close button and click that first.\n\n"
+    "Only use an [index] that actually appears in the elements list. When the "
+    "task is complete, or the answer is already visible, choose done and put the "
+    "answer in `text`. Do not repeat an action that just ran.\n\n"
+    "IMPORTANT — recognise completion from the actions-taken list. If it shows you "
+    "already performed the action that completes the task (e.g. clicked 'Add to "
+    "Cart' / 'Add to bag', submitted the form, logged in) and it did NOT error, "
+    "the task is DONE — choose done. Do NOT re-click it, set a quantity, or take "
+    "extra 'just to confirm' steps. A confirmation may not be visible on the page "
+    "and you should NOT go looking for one.\n\n"
+    "IF YOUR LAST PROPOSAL WAS REJECTED (the actions list shows 'gate rejected: …'): "
+    "do NOT repeat it. Read the reason and do something DIFFERENT — e.g. if it says "
+    "the item is the wrong product (forks not spoons), scroll or search for the "
+    "correct product and target THAT; if it says an overlay is blocking, dismiss "
+    "the overlay. If after trying you genuinely cannot find what's needed on this "
+    "page, choose done and honestly state what's missing — do NOT claim success."
+))
+
+# vision mode: same rules, but the screenshot (with numbered element boxes) is the
+# primary view of the page and the elements list is only a reference
+VISION_PLANNER_SYSTEM = SystemMessage(content=(
+    "You are looking at a SCREENSHOT of the browser viewport. Every interactive "
+    "element is outlined with a coloured box labelled with a number — that number "
+    "is the element's [index]. Decide primarily from what you SEE: the layout, "
+    "which popup is on top, which product / result / button is which. The text "
+    "elements list after the screenshot is a reference for reading labels and "
+    "confirming an [index]; it can include elements that are off-screen. If what "
+    "you need isn't visible, scroll.\n\n"
+) + PLANNER_SYSTEM.content)
+
+
+# what the analyse (verifier) node returns: an independent check on the action
+# the planner picked, before it runs.
+class Verdict(BaseModel):
+    approved: bool = Field(description="true only if the proposed action is correct AND grounded in the page")
+    reason: str = Field(description="one sentence: why it's right, or what's wrong / what to do instead")
+
+
+# judging rules shared by the DOM and vision verifiers
+_VERIFY_RULES = (
+    "NEVER reject based on WHICH SITE or DOMAIN the page is on. A regional mirror "
+    "(amazon.com vs amazon.com.au, google.com vs google.co.uk) is FINE — the task "
+    "can be completed on any equivalent site, so the specific domain is irrelevant. "
+    "Do not demand the agent return to some 'original' domain.\n\n"
+    "If an OVERLAY / MODAL / interstitial / cookie or region banner is blocking the "
+    "page, APPROVE any reasonable action that dismisses or closes it — clicking ×, "
+    "Close, Dismiss, Continue, Accept, or ANY of the modal's own buttons. Getting "
+    "past a blocker is always valid progress; do NOT quibble over which dismiss "
+    "button is best, and do NOT reject a dismiss action because of where it leaves "
+    "the user.\n\n"
+    "Judge by action type:\n"
+    "- INTERMEDIATE action (click/navigate/input/scroll — anything except done): "
+    "APPROVE if it is a sensible next step toward the task, EVEN IF it does not by "
+    "itself complete the task. Only REJECT if it is clearly wrong/ungrounded or "
+    "REDUNDANT (it or an equivalent already appears in the actions-taken list). "
+    "Never reject just because more steps remain.\n"
+    "- `done`: decide by TASK TYPE.\n"
+    "  • FIND / PRICE task: APPROVE done if it contains a $ price OR a prior extract "
+    "found one. Wrong brand is OK — the reply will note `(different brand)`. "
+    "Do NOT reject and send the agent searching again for brand match.\n"
+    "  • DO / ACTION task (e.g. 'add to cart', 'submit', 'log in'): APPROVE if the "
+    "actions-taken list already contains the completing action run WITHOUT error "
+    "(e.g. an 'Add to bag' click). Do NOT require a visible confirmation — those are "
+    "transient and often gone by now. Do NOT send the agent on a cart-verification "
+    "detour.\n"
+    "  REJECT done only if neither holds; then say what's still needed.\n\n"
+    "When rejecting, give one concrete next step."
+)
+
+# DOM-only fallback verifier (USE_VISION=false or the vision call failed)
+VERIFIER_SYSTEM = SystemMessage(content=(
+    "You are an independent verifier for a browser automation agent. You did NOT "
+    "choose the action. Judge ONLY whether the PROPOSED action is a reasonable "
+    "step. Do NOT redesign the task, second-guess which item/target the planner "
+    "picked, or propose a different item — assume the planner's target is correct "
+    "unless the action is clearly ungrounded (e.g. an [index] that isn't the right "
+    "element).\n\n"
+) + _VERIFY_RULES)
+
+
+# the primary verifier: judges from the SCREENSHOT with numbered element boxes,
+# using the DOM list only to read labels / find off-screen indices
+VISION_VERIFIER_SYSTEM = SystemMessage(content=(
+    "You are an independent verifier for a browser automation agent. You did NOT "
+    "choose the action. You see a SCREENSHOT of the current viewport where every "
+    "interactive element is outlined with a numbered box — the number is its "
+    "[index] — plus the text elements list for reference. Judge whether the "
+    "PROPOSED action is a reasonable step, primarily from what you SEE.\n\n"
+    "REJECT on VISIBLE problems:\n"
+    "- An OVERLAY / modal is covering the page (cookie/consent/newsletter/region "
+    "popup) and the action isn't dismissing it — clicks underneath will silently "
+    "fail. Say to dismiss the overlay first.\n"
+    "- The box with the proposed [index] is plainly the wrong element (e.g. the "
+    "action says 'Add to Cart' but that box is an ad, or it's forks when the task "
+    "wants spoons).\n\n"
+    "The target may be OFF-SCREEN (no box with that number visible) — the agent "
+    "scrolls it into view before clicking. If the elements list shows that [index] "
+    "as a sensible target, APPROVE. Do NOT second-guess which item the planner "
+    "picked unless it's clearly wrong, and do NOT second-guess the FLOW — e.g. "
+    "never reject an 'Add to Cart' click by arguing the product page must be "
+    "opened first.\n\n"
+) + _VERIFY_RULES + " Keep `reason` to one sentence.")
+
+
+def _decision_to_action(tools: Tools, d: PlanDecision) -> Any:
+    # turn the planner's PlanDecision into a real browser-use ActionModel. if a
+    # required field is missing we fall back to `done` so a bad decision stops the
+    # run cleanly instead of blowing up mid-loop.
+    AM = tools.registry.create_action_model(include_actions=[d.action])
+    if d.action == "navigate" and d.url:
+        return AM(navigate={"url": d.url, "new_tab": False})
+    if d.action == "click" and d.index is not None:
+        return AM(click={"index": d.index})
+    if d.action == "input" and d.index is not None and d.text is not None:
+        return AM(input={"index": d.index, "text": d.text})
+    if d.action == "scroll":
+        return AM(scroll={"down": d.down if d.down is not None else True})
+    if d.action == "extract" and d.text:
+        return AM(extract={"query": d.text})
+    if d.action == "done":
+        return AM(done={"text": d.text or "done", "success": d.success})
+    # malformed action (e.g. click with no index) -> stop gracefully
+    stop = tools.registry.create_action_model(include_actions=["done"])
+    return stop(done={"text": f"stopping: incomplete action {d.action!r}", "success": False})
+
+
+def _format_history(messages: list[dict], limit: int = 6) -> str:
+    # render recent conversation turns as text so the planner has chat context
+    # (so a follow-up like 'now click the first result' makes sense)
+    if not messages:
+        return ""
+    recent = messages[-limit:]
+    lines = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
+    return f"Conversation so far:\n{lines}\n\n"
+
+
+def _format_scratch(scratch: list[dict], limit: int = 10) -> str:
+    # render the actions already taken THIS task so the planner sees its own
+    # progress and doesn't repeat itself / oscillate. this is the fix for the
+    # click→navigate-back→click loop.
+    if not scratch:
+        return "Actions taken so far this task: (none yet — this is the first step)\n\n"
+    recent = scratch[-limit:]
+    lines = "\n".join(
+        f"{i}. {e['action']} -> {e['outcome']}" for i, e in enumerate(recent, 1)
+    )
+    return (
+        f"Actions you have ALREADY taken this task (do not repeat them; if these "
+        f"show the task is complete, choose done):\n{lines}\n\n"
+    )
+
+
+def _with_image(text: str, image_b64: str) -> UserMessage:
+    return UserMessage(content=[
+        ContentPartTextParam(text=text),
+        ContentPartImageParam(image_url=ImageURL(url=f"data:image/png;base64,{image_b64}")),
+    ])
+
+
+async def _marked_screenshot(session, summary) -> str | None:
+    # draw a numbered box on every interactive element so the vision model can
+    # point at an [index] (the label is the same number as in the DOM list)
+    if not summary.screenshot:
+        return None
+    try:
+        cdp = await session.get_or_create_cdp_session(focus=False)
+        return await create_highlighted_screenshot_async(
+            summary.screenshot, summary.dom_state.selector_map, cdp, filter_highlight_ids=False,
+        )
+    except Exception as e:
+        print(f"  (couldn't mark screenshot, sending it plain: {type(e).__name__}: {str(e)[:80]})")
+        return summary.screenshot
+
+
+async def node_plan(state: PipelineState, config: RunnableConfig) -> PipelineState:
+    # read the page, ask the model for the next action. with vision on, the vision
+    # model plans from a numbered-box screenshot (plus the DOM list as reference);
+    # otherwise the text planner works from the DOM alone. we also feed in the
+    # prior conversation so follow-up prompts have context.
+    session, _, _ = _resources(config)  # planner only reads the page; execute acts
+    step = state.get("step", 0) + 1
+
+    vision_llm = make_vision_llm()
+    summary = await session.get_browser_state_summary(include_screenshot=vision_llm is not None)
+    dom_text = summary.dom_state.llm_representation()
+    # cap the DOM text so a huge page doesn't blow up tokens/cost in the MVP
+    dom_text = dom_text[:6000]
+
+    history = _format_history(state.get("messages", [])[:-1])
+    # actions taken THIS task — the within-task memory that stops oscillation
+    progress = _format_scratch(state.get("scratch", []))
+    text = (
+        f"{history}"
+        f"Current request: {state['query']}\n\n"
+        f"{progress}"
+        f"Current page: {summary.title} ({summary.url})\n\n"
+        f"Interactive elements:\n{dom_text}"
+    )
+
+    decision: PlanDecision | None = None
+    mode = "vision"
+    image = await _marked_screenshot(session, summary) if vision_llm else None
+    if image:
+        try:
+            response = await _ainvoke_with_retry(
+                vision_llm, [VISION_PLANNER_SYSTEM, _with_image(text, image)], PlanDecision,
+            )
+            decision = response.completion
+        except Exception as e:
+            print(f"  (vision planner failed, using DOM: {type(e).__name__}: {str(e)[:80]})")
+    if decision is None:
+        mode = "DOM"
+        response = await _ainvoke_with_retry(
+            make_planner_llm(), [PLANNER_SYSTEM, UserMessage(content=text)], PlanDecision,
+        )
+        decision = response.completion
+
+    print(f"  [{step}] plan ({mode}) → {decision.action}")
+    return {"last_decision": decision, "step": step}
+
+async def _verify_dom(decision: "PlanDecision", query: str, dom_text: str,
+                      progress: str, title: str, url: str) -> Verdict:
+    # channel 1: judge the action from the TEXT DOM (same model as the planner)
+    verify_msg = UserMessage(content=(
+        f"Task: {query}\n\n"
+        f"{progress}"
+        f"Proposed action: {decision.action} "
+        f"(url={decision.url}, index={decision.index}, text={decision.text})\n"
+        f"Planner's reasoning: {decision.reasoning}\n\n"
+        f"Current page: {title} ({url})\n\n"
+        f"Interactive elements:\n{dom_text}"
+    ))
+    r = await _ainvoke_with_retry(make_planner_llm(), [VERIFIER_SYSTEM, verify_msg], Verdict)
+    return r.completion
+
+
+async def _verify_vision(decision: "PlanDecision", query: str, progress: str, dom_text: str,
+                         title: str, url: str, screenshot: str | None) -> Verdict | None:
+    # the primary verifier: judge the action from the numbered-box SCREENSHOT. returns
+    # None if vision is off / no screenshot / the call fails — caller then falls
+    # back to DOM-only so the agent never breaks just because vision is unavailable
+    llm = make_vision_llm()
+    if llm is None or not screenshot:
+        return None
+    try:
+        text = (
+            f"Task: {query}\n\n{progress}"
+            f"Proposed action: {decision.action} "
+            f"(index={decision.index}, url={decision.url}, text={decision.text})\n"
+            f"Planner's reasoning: {decision.reasoning}\n\n"
+            f"Current page: {title} ({url})\n\n"
+            f"Interactive elements (reference):\n{dom_text}\n\n"
+            f"Judge from the screenshot below."
+        )
+        r = await _ainvoke_with_retry(llm, [VISION_VERIFIER_SYSTEM, _with_image(text, screenshot)], Verdict)
+        return r.completion
+    except Exception as e:
+        print(f"  (vision channel unavailable: {type(e).__name__}: {str(e)[:80]})")
+        return None
+
+
+async def node_analyse(state: PipelineState, config: RunnableConfig) -> Command[Literal["execute", "plan"]]:
+    # verify before consequential actions (click, done). the vision verifier
+    # decides from the numbered-box screenshot; the DOM verifier only runs when
+    # vision is off or its call fails.
+    decision: PlanDecision = state["last_decision"]
+
+    if decision.action not in ("click", "done"):
+        return Command(goto="execute")
+
+    query = state.get("query", "")
+
+    # price found in done text — skip slow verifier LLM call
+    if decision.action == "done" and price_from_text(decision.text or ""):
+        print("  analyse [✓] done: price in answer")
+        return Command(goto="execute")
+
+    rej_key = f"(rejected: {decision.action} idx={decision.index} url={decision.url})"
+
+    # rejection loop guard: if this exact action was already rejected AND nothing
+    # has actually executed since, the planner is ignoring the feedback and
+    # spinning (plan→analyse→plan…). the execute-stage loop guard can't catch this
+    # because a rejected action never reaches execute. stop cleanly instead of
+    # looping to MAX_STEPS.
+    #
+    # BUT: only trip if there was NO real progress since the last such rejection.
+    # scratch stores executed actions as a dict `action`, and gate rejections as
+    # the rej_key STRING — so an executed (dict) entry after the last matching
+    # rejection means the situation changed (e.g. a `done` rejected as premature,
+    # then a modal 'Add to cart' actually clicked). re-evaluate rather than
+    # force-stop, or a legit second `done` gets killed as a "repeat".
+    scratch = state.get("scratch", [])
+    last_rej_idx = None
+    for i, e in enumerate(scratch):
+        if e.get("action") == rej_key:
+            last_rej_idx = i
+    if last_rej_idx is not None:
+        progressed = any(
+            not isinstance(e.get("action"), str)  # executed action -> dict; rejection -> str
+            for e in scratch[last_rej_idx + 1:]
+        )
+        if not progressed:
+            # if we already have a price from extract, return it instead of erroring
+            for e in reversed(scratch):
+                raw = str(e.get("outcome", ""))
+                if price_from_text(raw):
+                    answer = compact_glasses_reply(query, raw)
+                    print(f"  analyse → stop, using price {answer}")
+                    stop = PlanDecision(reasoning="returning best price found", action="done", text=answer)
+                    return Command(goto="execute", update={"last_decision": stop})
+            last_reason = scratch[last_rej_idx].get("outcome", "the action was rejected repeatedly")
+            print("  analyse → stop (same action rejected twice)")
+            stop = PlanDecision(
+                reasoning="stuck: the gate rejected the same action repeatedly",
+                action="done",
+                success=False,
+                text=f"couldn't complete this — {last_reason[:80]}",
+            )
+            return Command(goto="execute", update={"last_decision": stop})
+
+    session, _, _ = _resources(config)
+    summary = await session.get_browser_state_summary(cached=True, include_screenshot=True)
+    dom_text = summary.dom_state.llm_representation()[:6000]
+    progress = _format_scratch(state.get("scratch", []))
+
+    image = await _marked_screenshot(session, summary) if USE_VISION else None
+    verdict = await _verify_vision(decision, query, progress, dom_text,
+                                   summary.title, summary.url, image)
+    channel = "vision"
+    if verdict is None:
+        channel = "DOM"
+        verdict = await _verify_dom(decision, query, dom_text, progress,
+                                    summary.title, summary.url)
+
+    tag = "✓" if verdict.approved else "✗"
+    print(f"  analyse [{channel} {tag}] {decision.action}: {verdict.reason[:100]}")
+
+    if verdict.approved:
+        return Command(goto="execute")
+
+    entry = {"action": rej_key, "outcome": f"gate rejected: {verdict.reason}"}
+    return Command(goto="plan", update={"scratch": state.get("scratch", []) + [entry]})
+
+async def node_execute(state: PipelineState, config: RunnableConfig) -> PipelineState:
+    # run the action the planner chose. just browser-use's hands 
+    session, tools, file_system = _resources(config)
+    action = _decision_to_action(tools, state["last_decision"])
+
+    # loop guard: if the planner picks the same action a 3rd time it's spinning
+    # (navigate→click→navigate…), so force a clean stop. scroll is exempt since
+    # repeating it to page through content is fine.
+    action_dump = action.model_dump(exclude_unset=True)
+    action_name = next(iter(action_dump), "")
+    repeats = sum(1 for e in state.get("scratch", []) if e.get("action") == action_dump)
+
+    # price task: if extract already returned a price, stop re-extracting
+    query = state.get("query", "")
+    if action_name == "extract" and is_price_task(query):
+        for e in state.get("scratch", []):
+            if "extract" not in str(e.get("action", "")):
+                continue
+            raw = str(e.get("outcome", ""))
+            if price_from_text(raw):
+                answer = compact_glasses_reply(query, raw)
+                print(f"  ⚠ already have price, finishing: {answer}")
+                action = _decision_to_action(tools, PlanDecision(
+                    reasoning="extract already found a price",
+                    action="done",
+                    text=answer,
+                ))
+                action_dump = action.model_dump(exclude_unset=True)
+                action_name = "done"
+                break
+
+    if action_name != "scroll" and repeats >= 2:
+        print(f"  ⚠ loop guard: '{action_name}' repeated {repeats + 1}×, stopping")
+        action = _decision_to_action(tools, PlanDecision(
+            reasoning="loop guard: same action repeated without progress",
+            action="done",
+            success=False,
+            text="stopped: the agent kept repeating the same action without making progress",
+        ))
+        action_dump = action.model_dump(exclude_unset=True)
+        action_name = next(iter(action_dump), "")
+
+    result: ActionResult = await tools.act(
+        action, session, file_system=file_system, page_extraction_llm=make_extraction_llm()
+    )
+    # done when the planner emitted a `done` action (browser-use sets is_done)
+    done = bool(getattr(result, "is_done", False))
+    print(f"  exec → {action_name or action_dump}")
+    if getattr(result, "error", None):
+        print(f"  exec error: {result.error}")
+
+    # jot this action down in the within-task log so the next plan step sees it
+    # read the page fresh so the outcome reflects where the action landed us
+    after = await session.get_browser_state_summary(include_screenshot=False)
+    outcome = result.error or result.extracted_content or f"now on {after.url}"
+    entry = {"action": action_dump, "outcome": str(outcome)[:200]}
+    scratch = state.get("scratch", []) + [entry]
+    return {"last_result": result, "done": done, "scratch": scratch}
+
+async def node_resolve(state: PipelineState) -> Command[Literal["plan", "__end__"]]:
+    result = state.get("last_result")
+    step = state.get("step", 0)
+    query = state.get("query", "")
+    finished = state.get("done", False) or step >= MAX_STEPS
+
+    # price task: first successful extract → finish immediately (don't plan again)
+    if not finished and is_price_task(query):
+        content = getattr(result, "extracted_content", None) or ""
+        if price_from_text(content):
+            answer = compact_glasses_reply(query, str(content))
+            print(f"  done (early): {answer}")
+            return Command(goto=END, update={
+                "messages": [{"role": "assistant", "content": answer}],
+                "step": 0, "done": False, "scratch": [],
+            })
+
+    if finished:
+        reason = "task done" if state.get("done") else f"hit MAX_STEPS ({MAX_STEPS})"
+        answer = getattr(result, "extracted_content", None) or reason
+        answer = compact_glasses_reply(query, str(answer))
+        print(f"  done: {answer}")
+        return Command(goto=END, update={
+            "messages": [{"role": "assistant", "content": str(answer)}],
+            "step": 0,
+            "done": False,
+            "scratch": [],  # clear the within-task memory for the next task
+        })
+
+    # not done — go plan the next step
+    return Command(goto="plan")
