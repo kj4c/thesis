@@ -98,6 +98,17 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   "ambiguous: led with the premiere" in `notes` when it does. the same goes for
   an answer that leads with another country's earlier release and gives the US
   date as well (e.g. 3 May 2023 in the UK, versionB r0).
+  Google Search--3 ("comedy movies, sorted by user ratings … the Top 5") doesn't
+  say which list. the reference matches IMDb's Top 250 filtered to comedy; a
+  plain sort by user rating puts titles with a handful of votes, all rated 10,
+  at the top. so it's a 1 if the answer is IMDb's comedy list sorted by user
+  rating with a minimum number of votes (25,000 and 100,000 both count), read
+  correctly and in order, and the source names the minimum; it's a 0 without a
+  vote minimum, even when the answer says those ratings aren't reliable. (e.g.
+  versionB r0 at 25,000 and r2 at 100,000 are 1s; versionC_more r1 and
+  pilot_hybrid, the 10/10 lists, are 0s.) the 25,000-vote list currently has an
+  unreleased film at the top (*You Can See Everything*, 9.1): an answer that
+  lists it is still read correctly, so it's not marked down for it.
   an answer taken from Google's AI Overview is judged on whether it's right,
   as long as it says so: the source has to say it came from the Overview and
   wasn't confirmed on a source page. the source cards and chips inside the
@@ -128,6 +139,29 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   number of reviews, at least without an account: `s=review-count-rank` in a
   URL leaves the page on "Sort by: Featured". answers that say "sorted by
   review count" claim a sort that didn't happen.)
+  Amazon--6's "none" needs three things from the screenshots: the $100–200
+  price filter visibly applied on the list it read (the result count and a
+  "Clear" filter link, or the filter chip), more than a single Featured page
+  (two or more pages read, or one page sorted by Best Sellers, where the most
+  reviewed come first), and a source sentence that says truthfully which pages,
+  filters and sort it read. a list whose filters were typed into the URL counts
+  only if the page it read last shows them applied. (e.g. pilot3_noverifier,
+  two Featured pages with the filter applied, is a 1; versionC r0, one Best
+  Sellers page, is a 1; pilot3_hybrid, which sorted by Best Sellers and then
+  read a typed URL's page on Featured, is a 0; pilot2_vision, whose price
+  filter never applied, is a 0.)
+  Amazon--18 ("Open Amazon's home page and tell me what the deal is … list the
+  names of at least 2 items that are on offer and … what percent off they
+  are") is about the home page: the deal and its items have to be ones the home
+  page shows. items read from another page are a 0, whether Today's Deals
+  (versionB) or the deal card's own page, whose items differ from the home
+  page's tiles (pilot3_noverifier). each named item's name has to be on the
+  home page: as text on the screen, or in the page's element labels for the
+  versions that read them (check `steps.jsonl` or the step's `_dom.txt`). the
+  device tiles show only a picture and a percentage, so in vision only a name
+  guessed from the picture ("a Kindle e-reader") doesn't count, and one printed
+  on the product image does ("Hisense 50" QLED E7"). fewer than two such names
+  is a 0, even when the answer says the names are uncertain (pilot3_vision).
   where the task names what to search for, the search has to use those words:
   rewording it changes the results, so the answer is to a different task and
   is a 0. (e.g. Amazon--3, "climbing gears": a search for "climbing gear"

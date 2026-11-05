@@ -562,6 +562,40 @@ _VERIFIER_FIND_RULE = (
     "(which film is the latest) is the answer, not a premise, and needs support.\n"
 )
 
+# how a verifier judges `done`, by task type. the DOM verifier always uses it; the
+# vision verifier only in vision only, where it's the one that decides (30 Oct)
+# and checks done. it had only "reject if the screen clearly contradicts
+# completion", so it turned down an honest "none qualify" on Amazon--6 twice
+# until the step limit, where the same answer without a verifier got through
+# (3rd pilot, 5 Nov): vision only was judged by stricter rules than DOM
+_VERIFIER_DONE_RULES = (
+    "- `done`: decide by TASK TYPE.\n"
+    + _VERIFIER_FIND_RULE +
+    "  • DO / ACTION task (e.g. 'add to cart', 'submit', 'log in'): APPROVE if the "
+    "actions-taken list already contains the completing action run WITHOUT error "
+    "(e.g. an 'Add to bag' click). Do NOT require a visible confirmation — those are "
+    "transient and often gone by now. Do NOT send the agent on a cart-verification "
+    "detour.\n"
+    "  • SIGN-IN: the agent never signs in. If the content the task needs is behind "
+    "a sign-in (e.g. Amazon's 'Sign in to see customer reviews', shown on the page or "
+    "in an extract), and the done text says so and gives the closest answer the page "
+    "allows, APPROVE. Do NOT send the agent looking for a way around the sign-in.\n"
+    "  • NOTHING QUALIFIES: a done that says nothing meets the task's conditions is "
+    "a valid answer. APPROVE it if the done text says truthfully what was checked "
+    "(e.g. 'page 1 of 610 results', 'sorted by Avg. Customer Review') and the "
+    "actions-taken list backs that up. Don't assume what the task asks for exists, "
+    "and don't demand every page or a sort the site doesn't offer. You may REJECT "
+    "once, to ask for ONE specific further check that's clearly worth it (e.g. a "
+    "sort the page offers). If the actions-taken list already shows a 'nothing "
+    "qualifies' done rejected, APPROVE this one if it's honest. REJECT if it claims "
+    "a check (a sort, a filter, pages) the actions-taken list doesn't show.\n"
+    "  • LAST STEPS: if the agent is on one of its last 2 steps ('Step N of M'), "
+    "a rejection ends the task with no answer at all. APPROVE an honest done there, "
+    "one that says in its text what's unconfirmed or missing; REJECT only a done "
+    "that's wrong or claims a check the actions-taken list doesn't show.\n"
+    "  REJECT done only if none of these holds; then say what's still needed.\n\n"
+)
+
 VERIFIER_SYSTEM = SystemMessage(content=(
     _TOOL_REPLY_RULE + _UNTRUSTED_PAGE_RULE + _VERIFIER_UNTRUSTED_RULE +
     "You are an independent verifier for a browser automation agent. You did NOT "
@@ -593,31 +627,7 @@ VERIFIER_SYSTEM = SystemMessage(content=(
     "itself complete the task. Only REJECT if it is clearly wrong/ungrounded or "
     "REDUNDANT (it or an equivalent already appears in the actions-taken list). "
     "Never reject just because more steps remain.\n"
-    "- `done`: decide by TASK TYPE.\n"
-    + _VERIFIER_FIND_RULE +
-    "  • DO / ACTION task (e.g. 'add to cart', 'submit', 'log in'): APPROVE if the "
-    "actions-taken list already contains the completing action run WITHOUT error "
-    "(e.g. an 'Add to bag' click). Do NOT require a visible confirmation — those are "
-    "transient and often gone by now. Do NOT send the agent on a cart-verification "
-    "detour.\n"
-    "  • SIGN-IN: the agent never signs in. If the content the task needs is behind "
-    "a sign-in (e.g. Amazon's 'Sign in to see customer reviews', shown on the page or "
-    "in an extract), and the done text says so and gives the closest answer the page "
-    "allows, APPROVE. Do NOT send the agent looking for a way around the sign-in.\n"
-    "  • NOTHING QUALIFIES: a done that says nothing meets the task's conditions is "
-    "a valid answer. APPROVE it if the done text says truthfully what was checked "
-    "(e.g. 'page 1 of 610 results', 'sorted by Avg. Customer Review') and the "
-    "actions-taken list backs that up. Don't assume what the task asks for exists, "
-    "and don't demand every page or a sort the site doesn't offer. You may REJECT "
-    "once, to ask for ONE specific further check that's clearly worth it (e.g. a "
-    "sort the page offers). If the actions-taken list already shows a 'nothing "
-    "qualifies' done rejected, APPROVE this one if it's honest. REJECT if it claims "
-    "a check (a sort, a filter, pages) the actions-taken list doesn't show.\n"
-    "  • LAST STEPS: if the agent is on one of its last 2 steps ('Step N of M'), "
-    "a rejection ends the task with no answer at all. APPROVE an honest done there, "
-    "one that says in its text what's unconfirmed or missing; REJECT only a done "
-    "that's wrong or claims a check the actions-taken list doesn't show.\n"
-    "  REJECT done only if none of these holds; then say what's still needed.\n\n"
+    + _VERIFIER_DONE_RULES +
     "When rejecting, give one concrete next step."
 ))
 
@@ -647,8 +657,16 @@ VISION_VERIFIER_SYSTEM = SystemMessage(content=(
     "FLOW — e.g. never reject an 'Add to Cart' click by arguing the product page "
     "must be opened first. Element targeting is the DOM channel's job; you veto "
     "only VISIBLE blockers.\n\n"
-    "For done: reject only if the visible screen CLEARLY contradicts completion. "
-    "Keep `reason` to one sentence describing what you see."
+    + ((
+        "For done, you're the only check, so judge it as below. The screenshot "
+        "shows only the current view: a done can rest on earlier screenshots, "
+        "which the planner's notes and the actions-taken list record. Never "
+        "reject a done because this screenshot doesn't show all of the answer; "
+        "reject it only if what you see contradicts it.\n"
+        + _VERIFIER_DONE_RULES
+    ) if PERCEPTION == "vision" else
+        "For done: reject only if the visible screen CLEARLY contradicts completion. ")
+    + "Keep `reason` to one sentence describing what you see."
 ))
 
 
