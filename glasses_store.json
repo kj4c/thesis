@@ -39,6 +39,14 @@
       "media_path": "",
       "received_at": "2026-10-24T17:34:53.925402",
       "status": "acted"
+    },
+    {
+      "id": "e28eeea2-d0db-4a67-91c7-8532a8ae23bd",
+      "prompt": "What am I looking at",
+      "media_type": "image",
+      "media_path": "/Users/khyejaclow/Developer/thesis/browser_use/glasses_media/2b2b7e8d-697e-40e6-8fcc-81c632053a87.jpg",
+      "received_at": "2026-11-06T00:41:45.659135",
+      "status": "dismissed"
     }
   ]
 }

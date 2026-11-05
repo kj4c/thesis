@@ -7,6 +7,7 @@ import wx
 from . import a11y
 import calendar_storage
 from calendar_events import connect_google_calendar, disconnect_google_calendar
+from network import tailscale_ip
 
 PERMISSION_OPTIONS = [
     ('Every step', 'every_step'),
@@ -37,7 +38,7 @@ def _get_mdns_hostname() -> str:
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, settings: dict, glasses_server=None):
-        super().__init__(parent, title='Settings', size=(540, 540),
+        super().__init__(parent, title='Settings', size=(540, 600),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self._settings = dict(settings)
         self._glasses_server = glasses_server
@@ -151,12 +152,23 @@ class SettingsDialog(wx.Dialog):
         a11y.label(self._mdns_label, 'mDNS address')
         grid.Add(self._mdns_label, 1, wx.EXPAND)
 
+        ts_ip = tailscale_ip()
+        grid.Add(wx.StaticText(panel, label='Tailscale address:'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self._tailscale_label = wx.TextCtrl(
+            panel, value=f'{ts_ip}:{port}' if ts_ip else 'Tailscale is not running',
+            style=wx.TE_READONLY | wx.BORDER_NONE,
+        )
+        a11y.label(self._tailscale_label, 'Tailscale address')
+        grid.Add(self._tailscale_label, 1, wx.EXPAND)
+
         sizer.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
 
         hint = wx.StaticText(
             panel,
-            label='Point the Meta glasses companion app to either address above.\n'
-                  'Both require your phone and this computer to be on the same Wi-Fi.',
+            label='Enter one of these in the glasses app on your phone.\n'
+                  'LAN and mDNS need the phone on the same Wi-Fi. The Tailscale\n'
+                  'address works from any network once Tailscale is running on\n'
+                  'both, signed in to the same account.',
         )
         hint.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
         sizer.Add(hint, 0, wx.ALL, 12)

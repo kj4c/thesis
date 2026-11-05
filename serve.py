@@ -14,16 +14,17 @@
 #
 # ── how the phone/glasses app connects ───────────────────────────────────────
 # requirements:
-#   1. phone and this mac on the SAME wifi/lan (a private ip like 192.168.x.x
-#      is not reachable from the public internet).
-#   2. serve.py running here.
-#   3. macos firewall must ALLOW incoming connections for python (click "allow"
+#   1. serve.py running here.
+#   2. macos firewall must ALLOW incoming connections for python (click "allow"
 #      on the first-run popup, or System Settings -> Network -> Firewall).
 #
 # then point the app at this mac, either:
-#   - by mdns/bonjour: service "_http._tcp.local." named "Glasses Agent"
-#     (survives ip changes; only if the app does discovery), or
-#   - by ip: http://<this-mac-lan-ip>:8765   (find it: ipconfig getifaddr en0)
+#   - from ANY network: install tailscale on this mac and the phone, sign both
+#     into the same account, and use http://<tailscale-ip>:8765 (printed at
+#     startup; the tailnet is private, nothing is exposed to the internet), or
+#   - on the same wifi: by ip http://<this-mac-lan-ip>:8765, or by mdns/bonjour
+#     as service "_http._tcp.local." named "Glasses Agent" (if the app does
+#     discovery)
 #
 # sanity check from the phone's browser first: http://<ip>:8765/health
 # should return {"status": "ok", ...}. if that works, the app will too.
@@ -44,6 +45,7 @@ import llm
 from glasses_vision import enrich_prompt_with_image
 from graph import build_agent
 from mvp import run_turn_with_result
+from network import lan_ip, tailscale_ip
 from state import _start_resources, _run_config
 
 DEFAULT_PORT = 8765
@@ -53,21 +55,10 @@ SERVICE_TYPE = "_http._tcp.local."
 SERVICE_NAME = "Glasses Agent"
 
 
-def _lan_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
 async def _register_mdns(port: int) -> AsyncZeroconf:
     # advertise the server over mdns so the phone app can find it by name
     # (e.g. "Glasses Agent._http._tcp.local.") without a hardcoded ip.
-    ip = _lan_ip()
+    ip = lan_ip()
     info = ServiceInfo(
         SERVICE_TYPE,
         f"{SERVICE_NAME}.{SERVICE_TYPE}",
@@ -186,6 +177,10 @@ def main():
     # 0.0.0.0 so the glasses (on the same lan) can reach it, not just localhost
     print(f"[glasses] listening on http://0.0.0.0:{port}  "
           f"(/health, POST /data)")
+    print(f"[glasses] same wifi:    http://{lan_ip()}:{port}")
+    ts = tailscale_ip()
+    print(f"[glasses] any network:  http://{ts}:{port}" if ts else
+          "[glasses] any network:  tailscale not running on this mac")
     web.run_app(app, host="0.0.0.0", port=port, print=None)
 
 

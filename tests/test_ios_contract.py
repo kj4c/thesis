@@ -33,7 +33,18 @@ def test_app_posts_the_payload_keys_the_server_reads():
 
 def test_app_targets_the_data_endpoint_on_the_default_port():
     assert '/data"' in SWIFT
-    assert 'var port = "8765"' in SWIFT
+    assert re.search(r'forKey: "backendPort"\) \?\? "8765"', SWIFT)
+
+
+def test_backend_address_is_editable_and_remembered():
+    # switching between home wifi and tailscale must not need a rebuild
+    for key in ("backendHost", "backendPort"):
+        assert f'UserDefaults.standard.set(' in SWIFT and f'forKey: "{key}"' in SWIFT
+    assert "$agent.host" in SWIFT and "$agent.port" in SWIFT
+
+
+def test_bad_backend_address_does_not_crash_the_app():
+    assert not re.search(r'URL\(string: "http://[^"]*"\)!', SWIFT)
 
 
 def test_app_waits_long_enough_for_an_agent_run():

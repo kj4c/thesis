@@ -41,6 +41,23 @@ python run.py
 
 this launches the main window (`gui/main.py:AgentApp`).
 
+## connecting the glasses from any network
+
+the agent runs on this mac; the phone reaches it through tailscale, a free
+private network between your own devices (nothing is exposed to the internet).
+
+1. on the mac: `brew install --cask tailscale-app`, open tailscale and sign in.
+2. on the iphone: install **tailscale** from the app store and sign in with the
+   same account.
+3. start the agent (`python run.py` or `python serve.py`). the mac's tailscale
+   address (`100.x.x.x:8765`) is shown in settings → smart glasses, or printed
+   by `serve.py` at startup.
+4. in the glasses app, tap the ladybug and enter that address as the backend.
+   it's remembered, so switch back to the wi-fi address the same way.
+
+the mac has to stay awake: keep it plugged in and run the agent under
+`caffeinate -i`, e.g. `caffeinate -i python run.py`.
+
 ## features
 
 ### task input and agent runs
