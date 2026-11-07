@@ -523,14 +523,12 @@ class MainFrame(wx.Frame):
                 self._log(f'[Stopped] {answer}', speak=True)
                 self._set_status(READY)
             else:
-                # the agent stores the full answer; the screen reader and the
-                # phone (which reads it aloud) get the short form. any ending
-                # but ok (gave up, step limit, a failure) is an Error
+                # the screen reader reads the full answer; only the phone
+                # (which reads it aloud on the glasses) gets the short form.
+                # any ending but ok (gave up, step limit, a failure) is an Error
                 succeeded = await self._last_status() == 'ok'
                 result = compact_glasses_reply(query, answer)
-                self._log(f'\n[{DONE if succeeded else ERROR}] {result}', speak=True)
-                if len(answer.strip()) > len(result):
-                    self._log(f'Full answer: {answer.strip()}')
+                self._log(f'\n[{DONE if succeeded else ERROR}] {answer.strip()}', speak=True)
                 self._finish_status(DONE if succeeded else ERROR)
         except asyncio.CancelledError:
             # the Stop button: whatever step was running is abandoned, and the

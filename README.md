@@ -56,8 +56,8 @@ this launches the main window (`gui/main.py:AgentApp`).
   current plan, and the action(s) it's taking (navigating, clicking, typing,
   scrolling, extracting page content, etc.). if the agent's own check turns
   a step down, the log says why and the agent plans again.
-- a run ends with the agent's reply; when the reply was shortened for
-  speaking aloud, the full answer is shown underneath.
+- a run ends with the agent's reply, which the screen reader reads in full;
+  only the reply sent back to the glasses phone is shortened.
 - status bar shows `ready` / `running…` / `done` / `stopped` / `error`.
 
 ### permission prompts

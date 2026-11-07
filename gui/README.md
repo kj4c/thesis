@@ -57,9 +57,9 @@ this launches the main window (`gui/main.py:AgentApp`).
   scrolling, extracting page content, etc.). if the agent's own check turns
   a step down, the log says why and the agent plans again.
 - a run ends with the agent's reply, logged as `[Done]` if the agent finished
-  the task and `[Error]` if it didn't (gave up, ran out of steps, or failed);
-  when the reply was shortened for speaking aloud, the full answer is shown
-  underneath.
+  the task and `[Error]` if it didn't (gave up, ran out of steps, or failed).
+  the screen reader reads the whole reply; only the reply sent back to the
+  glasses phone is shortened.
 - the status bar's first field says what the agent is doing:
   - **ready**: on, and doing nothing.
   - **running**: working on a task.
