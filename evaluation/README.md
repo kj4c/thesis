@@ -109,6 +109,19 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   pilot_hybrid, the 10/10 lists, are 0s.) the 25,000-vote list currently has an
   unreleased film at the top (*You Can See Everything*, 9.1): an answer that
   lists it is still read correctly, so it's not marked down for it.
+  Google Search--21 ("the top 5 highest-grossing animated movies, sorted by box
+  office earnings") has changed since 2023: Wikipedia's "List of
+  highest-grossing animated films" now starts with Ne Zha 2, Zootopia 2 and
+  Inside Out 2. the list as the screenshots show it on the day of the run is
+  the reference: a 1 if the top 5 are that list's first five, in order (the
+  figures aren't required). (e.g. every pilot run, which gave Ne Zha 2,
+  Zootopia 2, Inside Out 2, The Lion King (2019), Frozen II.)
+  Google Search--19 ("the first 7 bits of the SHA of the Bert's latest
+  commit") needs `eedf571`, the merge of pull request #1027, which is the
+  latest commit on master. `8028c04` is the pull request's own commit ("Add
+  links to 24 smaller BERT models"), one before it, reached by opening the
+  pull request or the commit title: it's a 0, even though the change it
+  describes is the same (pilot_vision_clean r1, pilot2_noverifier).
   an answer taken from Google's AI Overview is judged on whether it's right,
   as long as it says so: the source has to say it came from the Overview and
   wasn't confirmed on a source page. the source cards and chips inside the
@@ -145,9 +158,13 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   (two or more pages read, or one page sorted by Best Sellers, where the most
   reviewed come first), and a source sentence that says truthfully which pages,
   filters and sort it read. a list whose filters were typed into the URL counts
-  only if the page it read last shows them applied. (e.g. pilot3_noverifier,
+  only if the page it read last shows them applied. on a Best Sellers page
+  the top listings are enough: a stroller with over 20,000 reviews would be
+  among the first few best sellers, so reading the top 10 or so of that page
+  counts, as long as the source says how much it read. (e.g. pilot3_noverifier,
   two Featured pages with the filter applied, is a 1; versionC r0, one Best
-  Sellers page, is a 1; pilot3_hybrid, which sorted by Best Sellers and then
+  Sellers page, is a 1; pilot4_dom, about 11 listings of one Best Sellers page
+  with the filter shown, is a 1; pilot3_hybrid, which sorted by Best Sellers and then
   read a typed URL's page on Featured, is a 0; pilot2_vision, whose price
   filter never applied, is a 0.)
   Amazon--18 ("Open Amazon's home page and tell me what the deal is … list the
@@ -162,6 +179,10 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   guessed from the picture ("a Kindle e-reader") doesn't count, and one printed
   on the product image does ("Hisense 50" QLED E7"). fewer than two such names
   is a 0, even when the answer says the names are uncertain (pilot3_vision).
+  pilot4_vision, "Fire TV Cube" and "Toshiba Z670R" printed on the product
+  images, is a 1. the deal and the items may come from different parts of the
+  home page, e.g. the hero banner named as the deal and the items from "Save
+  on Amazon Devices" (pilot4_dom, a 1).
   where the task names what to search for, the search has to use those words:
   rewording it changes the results, so the answer is to a different task and
   is a 0. (e.g. Amazon--3, "climbing gears": a search for "climbing gear"
