@@ -97,7 +97,10 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   to the main-answer rule; it's a 0 only if the information is wrong. write
   "ambiguous: led with the premiere" in `notes` when it does. the same goes for
   an answer that leads with another country's earlier release and gives the US
-  date as well (e.g. 3 May 2023 in the UK, versionB r0).
+  date as well (e.g. 3 May 2023 in the UK, versionB r0). the date it leads with
+  has to be a release: 19 April 2023 in South Korea was a press event, not a
+  release, so an answer that leads with it is a 0 (`baseline_second`,
+  `baseline_third`).
   Google Search--3 ("comedy movies, sorted by user ratings … the Top 5") doesn't
   say which list. the reference matches IMDb's Top 250 filtered to comedy; a
   plain sort by user rating puts titles with a handful of votes, all rated 10,
@@ -161,6 +164,12 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   number of reviews, at least without an account: `s=review-count-rank` in a
   URL leaves the page on "Sort by: Featured". answers that say "sorted by
   review count" claim a sort that didn't happen.)
+  a list sorted by Avg. Customer Review doesn't back "none" (decided 9 Nov):
+  it sorts by star rating, so highly rated strollers with a handful of
+  reviews come first and one with 20,000 reviews needn't be near the top.
+  only Best Sellers ranks by how much a product sells, which follows its
+  number of reviews closely enough. (e.g. `baseline_first`, compare_r3_vision:
+  0s.)
   Amazon--6's "none" needs three things from the screenshots: the $100–200
   price filter visibly applied on the list it read (the result count and a
   "Clear" filter link, or the filter chip), more than a single Featured page
@@ -192,16 +201,37 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   images, is a 1. the deal and the items may come from different parts of the
   home page, e.g. the hero banner named as the deal and the items from "Save
   on Amazon Devices" (pilot4_dom, a 1).
+  an answer read from a page reached through Google (or any other site) is a
+  0 in every Amazon task (decided 9 Nov): the task is to find it on Amazon,
+  with Amazon's own search, menus and filters. a detour through Google that
+  ends back on Amazon's own search still counts as long as the answer is read
+  from that search; an Amazon page opened from Google's results doesn't.
+  (e.g. `baseline_bugfix_first` Amazon--36 and `_rerun3` Amazon--33, which
+  went to Google after bot checks on Amazon; Amazon--30's rule below says the
+  same.)
   where the task names what to search for, the search has to use those words:
   rewording it changes the results, so the answer is to a different task and
   is a 0. (e.g. Amazon--3, "climbing gears": a search for "climbing gear"
   returns different first results, versionA r2.)
   Amazon--33 ("a portable air conditioner … suitable for a room size of 300 sq
   ft, with energy efficiency rating, and compare the prices of the top three
-  search results") is read the same way: "energy efficiency" is part of what to
-  search for, so a search without it is a 0 (versionB r0). the task is the
-  price comparison, so an answer that says truthfully the three listings
-  don't show a rating is fine; it doesn't have to open each product page.
+  search results") asks for three conditions, and each has to be met either by
+  the search or by what the answer checked (clarified 9 Nov):
+  "300 sq ft" can be left out of the search if the answer states each of the
+  three listings' room size and they cover 300 sq ft; "energy efficiency" is
+  harder to check from a listing, so it has to be in the search ("energy
+  efficient" and "energy efficiency rating" count: compare_r1_hybrid, r2_hybrid,
+  r3_hybrid), unless the answer gives an efficiency rating (CEER, EER, Energy
+  Star) it actually read for each of the three. BTU or SACC figures are
+  capacity, not efficiency. so a search for "portable air conditioner 300 sq
+  ft" whose answer says no rating was shown, or that it didn't open the product
+  pages, is a 0 (versionB r0, every DOM, vision-only and no-verifier comparison
+  answer). once the search has it, the task is the price comparison, so an
+  answer that says truthfully the three listings don't show a rating is fine;
+  it doesn't have to open each product page. the search has to be Amazon's
+  own: a results page reached through Google is a 0 (`baseline_bugfix_first
+  _rerun3`, which reached an Amazon page through Google after its searches hit
+  bot checks).
   Amazon--30 ("the highest-rated fiction book released in 2024, with a
   minimum of 50 customer reviews") has no single right answer: taken
   literally it's a little-known 4.9-star book, while the reference reads it as
@@ -240,23 +270,45 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   shipping label; ship it" is out of date: in November 2026 the popup says "Go
   to Your Orders to start the return; select your preferred free shipping
   option; drop off and leave!", and the help page describes a QR code taken to
-  a drop-off location, so either version, as the screenshots show it, is a 1
-  (confirmed with the team, 9 Nov). steps the answer says come from "general
-  Amazon flow", or steps given without reading either page, are a 0
-  (compare_r1_vision). the colour can be any option named Black (e.g. "934
-  Black" or "965 Black"). the size has to be selected, as the page's "Size:"
-  label shows it: a clicked or outlined XX-Large button doesn't count while
-  the label still says X-Large. an answer that says Black and XX-Large were
-  selected when the label shows another size is a 0, even though the return
-  steps are the same for every size: a user who pressed Buy at that point
-  would get the wrong shirt. (e.g. compare_r1_dom, r2_hybrid and r3_vision,
-  0s; r2_dom_reruns and r3_dom, whose label changed to XX-Large, 1s.)
+  a drop-off location, so either version is a 1 (confirmed with the team,
+  9 Nov). the colour can be any option named Black (e.g. "934 Black" or "965
+  Black"). the size has to be selected, as the page's "Size:" label shows it:
+  a clicked or outlined XX-Large button doesn't count while the label still
+  says X-Large, and an answer that says XX-Large was selected when the label
+  shows another size is a 0, even though the return steps are the same for
+  every size: a user who pressed Buy at that point would get the wrong shirt.
+  **the agent has to have checked both, and the run's record has to show it
+  (decided 9 Nov): it can't be right by accident.** the record is the
+  screenshots, the saved page text (`stepNN_dom.txt`, from 1 Nov) and the
+  agent's `extract` results in `steps.jsonl`. so:
+  - the steps: the popup or help page text on a screenshot, in the saved
+    page text of a step the agent read, or in an `extract` result. the popup's
+    "How to return this item" is in the page's text even while the popup is
+    closed, so an extract that quotes it counts. steps from "general Amazon
+    flow", or that appear nowhere in the record, are a 0, even when they
+    match (compare_r1_vision; `baseline_first`, whose extracts never had them).
+  - the size: the "Size:" label showing XX-Large on a screenshot, in the saved
+    page text, or in an extract that reports it as the selected size. an
+    extract that only repeats the size the agent asked about doesn't count
+    (versionA r1: its request said "(Black, XX-Large)"). a page reached through
+    Amazon's "black xx-large" suggestion usually opens on XX-Large, but if
+    nothing in the record shows the label, it's a 0
+    (`baseline_bugfix_first_rerun5`, though replaying its route live showed
+    XX-Large).
+  (e.g. 1s: compare_r1_hybrid, r2_dom_reruns, r3_dom, r3_hybrid; versionC r0
+  and versionC_more r0, r1 (saved page text); `baseline_second`, versionA r2,
+  versionB r0 (extracts that report "Size: XX-Large" and quote the popup).
+  0s: compare_r1_dom, r2_hybrid, r3_vision, r1_noverifier and r2_noverifier,
+  whose label stayed X-Large.)
   checked live on 9 Nov: a click that works changes the "Size:" label within
   a second, along with the selected colour's price ($24.29 for X-Large, $26.99
-  for XX-Large on 934 Black) and the stock line. so the price and stock line
-  confirm the size when the label is out of view. the "Selected Size is …"
+  for XX-Large on 934 Black) and the stock line. the "Selected Size is …"
   label read out for the collapsed size header (`aria-label`) doesn't update
   even when the click works: don't go by it.
+  Amazon--39 ("a travel guide book on Amazon for Japan"): take the most general
+  reading of the task, a guide to Japan. a guide to one or two cities is a 0,
+  even when the answer says so (compare_r1_noverifier: Lonely Planet Pocket
+  Kyoto & Osaka).
 - **content that needs a sign-in**: the agent never signs in, so part of a
   page can be out of reach (e.g. Amazon's full reviews: "Sign in to see
   customer reviews"). if the agent correctly says that a sign-in is what
