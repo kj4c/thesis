@@ -116,6 +116,15 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   the reference: a 1 if the top 5 are that list's first five, in order (the
   figures aren't required). (e.g. every pilot run, which gave Ne Zha 2,
   Zootopia 2, Inside Out 2, The Lion King (2019), Frozen II.)
+  Google Search--18 ("when and where the most recent World Cup was held, and
+  which team was the winner") has changed since 2023: the 2026 World Cup
+  (Canada, Mexico and the United States, 11 June – 19 July 2026, won by Spain)
+  had been played by the time of the runs. the most recent tournament as the
+  screenshots show it is the reference, as with Google Search--21: an answer
+  of 2022 (Qatar, Argentina) is a 0, even though it matches the 2023
+  reference, when the screenshots show the 2026 result (compare_r1_vision,
+  which read on Wikipedia that Spain won in 2026 and then answered 2022). all
+  three parts (dates, hosts, winner) are needed for a 1.
   Google Search--19 ("the first 7 bits of the SHA of the Bert's latest
   commit") needs `eedf571`, the merge of pull request #1027, which is the
   latest commit on master. `8028c04` is the pull request's own commit ("Add
@@ -206,6 +215,48 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   Amazon top-rated or best-seller list for 2024 fiction, and (4) answered with
   the top title on that list with at least 50 reviews. finding the book through
   another site, such as Google, is a 0.
+  a material the task asks for (e.g. Amazon--21's "stainless steel") has to be
+  shown for the product answered: in its title, its specifications or details
+  (Material, Finish), or by Amazon's own material filter, applied on the list
+  the product was picked from. it doesn't count when the word is only in the
+  search box, or only in another colour option of the same listing: the
+  agent has to check, not assume. (e.g. Amazon--21: the Cuisinart DCC-1200NAS
+  is listed as "Brushed Chrome", with "Black Stainless Steel" only as a
+  separate colour, DCC-1200BKSNAS; none of the 8 comparison answers that named
+  it applied the Stainless Steel filter, so all 8 are 0s, even though the
+  machine may well be stainless and a person might have assumed the same. the
+  DCC-1200BKSNAS, "Black Stainless Steel" in its title, is a 1.)
+  Amazon--12 ("give me the top review about this Ride On Car") needs the text
+  of a customer's review: the excerpt the page shows counts (see "content that
+  needs a sign-in", below). a review's title and author without its text is a
+  0 (compare_r1_dom), and so is Amazon's AI "Customers say" summary, which is
+  not a customer's review, even when the answer says it's the summary
+  (6 comparison answers). if the page shows no customer excerpt, the answer has
+  to say that there isn't one, not stand in the summary for it.
+  Amazon--16 ("If Free return is available, tell me how to return this
+  item"): the steps have to be read from Amazon's pages for this item, i.e. the
+  FREE Returns popup ("How to return this item") or the return help page it
+  links to, and match what they show. the 2023 reference's "print the return
+  shipping label; ship it" is out of date: in November 2026 the popup says "Go
+  to Your Orders to start the return; select your preferred free shipping
+  option; drop off and leave!", and the help page describes a QR code taken to
+  a drop-off location, so either version, as the screenshots show it, is a 1
+  (confirmed with the team, 9 Nov). steps the answer says come from "general
+  Amazon flow", or steps given without reading either page, are a 0
+  (compare_r1_vision). the colour can be any option named Black (e.g. "934
+  Black" or "965 Black"). the size has to be selected, as the page's "Size:"
+  label shows it: a clicked or outlined XX-Large button doesn't count while
+  the label still says X-Large. an answer that says Black and XX-Large were
+  selected when the label shows another size is a 0, even though the return
+  steps are the same for every size: a user who pressed Buy at that point
+  would get the wrong shirt. (e.g. compare_r1_dom, r2_hybrid and r3_vision,
+  0s; r2_dom_reruns and r3_dom, whose label changed to XX-Large, 1s.)
+  checked live on 9 Nov: a click that works changes the "Size:" label within
+  a second, along with the selected colour's price ($24.29 for X-Large, $26.99
+  for XX-Large on 934 Black) and the stock line. so the price and stock line
+  confirm the size when the label is out of view. the "Selected Size is …"
+  label read out for the collapsed size header (`aria-label`) doesn't update
+  even when the click works: don't go by it.
 - **content that needs a sign-in**: the agent never signs in, so part of a
   page can be out of reach (e.g. Amazon's full reviews: "Sign in to see
   customer reviews"). if the agent correctly says that a sign-in is what
