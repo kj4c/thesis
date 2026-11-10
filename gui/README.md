@@ -124,8 +124,10 @@ the app is set up for VoiceOver on macos (`gui/a11y.py`):
 - chrome takes the front when it opens and whenever it opens or switches a
   tab; the app takes it back after the browser starts, after each step, for
   each dialog, and when a task ends (then speaks the outcome a moment later).
-- while a task runs, focus waits on **stop**, so closing a dialog lands
-  there; when it ends, focus goes back to the task box.
+- while a task runs, focus waits on the activity log, and closing a dialog
+  (by any button, return or escape) puts it back there; when the task ends,
+  focus goes to the task box.
+- in the dialog's reason field, return denies, the same as escape.
 - with approval on every step the plan isn't spoken, since the dialog that
   follows shows it and would cut the speech off.
 - a permission or glasses dialog brings the app to the front and starts on

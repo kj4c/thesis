@@ -197,7 +197,10 @@ class PermissionDialog(wx.Dialog):
 
         reason_label = wx.StaticText(self, label='If you deny it, why? (optional, e.g. "wrong product"):')
         sizer.Add(reason_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
-        self._reason = wx.TextCtrl(self)
+        # Return here denies, like Escape: without TE_PROCESS_ENTER it would
+        # press the default button, Approve, right after typing why not to
+        self._reason = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
+        self._reason.Bind(wx.EVT_TEXT_ENTER, lambda _: self._close('no'))
         a11y.label(self._reason, 'Reason for denying',
                    'Optional. With a reason, the agent tries another way. Without one, Deny ends the task.')
         sizer.Add(self._reason, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
@@ -518,10 +521,8 @@ class MainFrame(wx.Frame):
         self.run_btn.Disable()
         self.new_task_btn.Disable()
         self.stop_btn.Enable()
-        # while it runs, focus waits on Stop: it's the one control that's useful
-        # then, and closing an approval dialog brings focus back here, so
-        # voiceover says "Stop, button" rather than reading the task box
-        self.stop_btn.SetFocus()
+        # while it runs, focus waits on the log, where the steps appear
+        self._focus_log()
 
         self._agent_future = asyncio.run_coroutine_threadsafe(
             self._run_agent_async(task, glasses_item, reply), self._loop
@@ -707,6 +708,11 @@ class MainFrame(wx.Frame):
                 self._log(f'  Problem: {error}')
                 self._set_status(ERROR)  # back to Running when it plans again
 
+    def _focus_log(self):
+        # cursor at the end, so the newest lines are the ones read from there
+        self.log.SetInsertionPointEnd()
+        self.log.SetFocus()
+
     def _plan_spoken(self) -> bool:
         # with approval on every step, a dialog follows each new plan straight
         # away and shows it, and its speech would cut the plan's off
@@ -786,6 +792,9 @@ class MainFrame(wx.Frame):
         dlg.ShowModal()
         self._permission_answer = dlg.answer
         dlg.Destroy()
+        # back to the log, not the task box, however the dialog was answered;
+        # if that ended the task, focus moves on to the task box at the end
+        self._focus_log()
         self._permission_.set()
 
     def _on_stop(self, _):
