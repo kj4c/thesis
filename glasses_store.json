@@ -1,0 +1,36 @@
+{
+  "items": [
+    {
+      "id": "48af0e36-a60d-41b1-9f35-53354c0385a9",
+      "prompt": "Search Google for the capital of Australia",
+      "media_type": "text",
+      "media_path": "",
+      "received_at": "2026-11-10T20:27:30.594533",
+      "status": "acted"
+    },
+    {
+      "id": "b352635f-a297-4bc2-8331-a4167c02d32c",
+      "prompt": "Search Google for the capital of Australia",
+      "media_type": "text",
+      "media_path": "",
+      "received_at": "2026-11-10T20:28:45.235457",
+      "status": "dismissed"
+    },
+    {
+      "id": "abc83815-4571-4248-9cb9-c68ce344ec23",
+      "prompt": "Search Google for the capital of Australia",
+      "media_type": "text",
+      "media_path": "",
+      "received_at": "2026-11-10T20:29:02.716743",
+      "status": "cancelled"
+    },
+    {
+      "id": "9a440080-497b-47a2-9aa9-4cb8a5494262",
+      "prompt": "Search Google for the capital of Australia",
+      "media_type": "text",
+      "media_path": "",
+      "received_at": "2026-11-10T20:29:30.026434",
+      "status": "pending"
+    }
+  ]
+}

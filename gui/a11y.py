@@ -60,11 +60,12 @@ def announce(text: str):
 
 def bring_to_front():
     # make this the active app, so a dialog that needs an answer is read out
-    # even when the agent's browser window was in front
+    # and takes the keyboard even when the agent's browser window was in front.
+    # the deprecated call on purpose: since macos 14 the newer activate() is
+    # only a request, refused while another app (chrome) is active; this one
+    # still works (tested on macos 26.5, 10 nov)
     if AppKit is None:
         return
     app = AppKit.NSApp()
-    if app.respondsToSelector_('activate'):
-        app.activate()
-    else:
+    if not app.isActive():
         app.activateIgnoringOtherApps_(True)

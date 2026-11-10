@@ -121,6 +121,13 @@ the app is set up for VoiceOver on macos (`gui/a11y.py`):
   recording and transcription, the glasses listener turning on or off, and
   a phone request being turned away because the agent is busy. individual
   steps are not narrated; they are in the activity log.
+- chrome takes the front when it opens and whenever it opens or switches a
+  tab; the app takes it back after the browser starts, after each step, for
+  each dialog, and when a task ends (then speaks the outcome a moment later).
+- while a task runs, focus waits on **stop**, so closing a dialog lands
+  there; when it ends, focus goes back to the task box.
+- with approval on every step the plan isn't spoken, since the dialog that
+  follows shows it and would cut the speech off.
 - a permission or glasses dialog brings the app to the front and starts on
   its details, so it is read out even if the browser window was in front.
 

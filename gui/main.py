@@ -48,6 +48,8 @@ READY, RUNNING, DONE, STOPPED, ERROR = 'Ready', 'Running', 'Done', 'Stopped', 'E
 
 # how long Done or Error stays up after a task ends, before going back to Ready
 STATUS_HOLD_MS = 5000
+# how long the end-of-task speech waits after bringing the app to the front
+FRONT_SPEAK_DELAY_MS = 1000
 
 
 def load_settings():
@@ -418,14 +420,31 @@ class MainFrame(wx.Frame):
 
     # log helpers, safe to call from any thread
 
-    def _log(self, msg: str, speak: bool = False):
+    def _log(self, msg: str, speak: bool = False, front: bool = False):
         # speak=True also has the screen reader say the line, for the moments a
-        # user needs to hear without going to read the log
+        # user needs to hear without going to read the log. front=True brings
+        # the app forward first: VoiceOver drops announcements from an app in
+        # the background, and the browser is usually in front when a task ends
         wx.CallAfter(self.log.AppendText, msg + '\n')
         if speak:
             # '[Voice] Recording started.' is spoken as 'Voice: Recording started.'
             spoken = msg.strip().replace('[!] ', '').replace('[', '', 1).replace(']', ':', 1)
-            wx.CallAfter(a11y.announce, spoken)
+            wx.CallAfter(self._announce_in_front if front else a11y.announce, spoken)
+
+    def _announce_in_front(self, text: str):
+        # coming to the front makes VoiceOver say the window and the focused
+        # control; the announcement waits for that to start, so it interrupts
+        # it rather than being cut off by it. focus inside the window stays put
+        self._take_front()
+        wx.CallLater(FRONT_SPEAK_DELAY_MS, a11y.announce, text)
+
+    def _take_front(self):
+        # chrome takes the front when it starts and whenever browser_use opens
+        # or switches a tab, which leaves the keyboard and voiceover on the
+        # browser; this brings them back to this window (a no-op if it's
+        # already in front, so voiceover isn't made to repeat itself)
+        a11y.bring_to_front()
+        self.Raise()
 
     def _set_status(self, text: str):
         wx.CallAfter(self._show_status, text)
@@ -459,10 +478,12 @@ class MainFrame(wx.Frame):
         return (await self._workflow.aget_state(self._config)).values.get('status')
 
     def _announce_run_finished(self):
-        # the outcome is spoken by _log(speak=True). focus stays where it is,
-        # because moving it would cut that speech off; the log's cursor is left
-        # at the end for when the user goes to read the detail.
+        # the outcome is spoken by _log(speak=True, front=True) a moment after
+        # this, so moving focus back to the task box (ready for the next task)
+        # doesn't cut it off; the log's cursor is left at the end for when the
+        # user goes to read the detail
         self.log.SetInsertionPointEnd()
+        self.prompt.SetFocus()
 
     # agent execution
 
@@ -497,6 +518,10 @@ class MainFrame(wx.Frame):
         self.run_btn.Disable()
         self.new_task_btn.Disable()
         self.stop_btn.Enable()
+        # while it runs, focus waits on Stop: it's the one control that's useful
+        # then, and closing an approval dialog brings focus back here, so
+        # voiceover says "Stop, button" rather than reading the task box
+        self.stop_btn.SetFocus()
 
         self._agent_future = asyncio.run_coroutine_threadsafe(
             self._run_agent_async(task, glasses_item, reply), self._loop
@@ -513,6 +538,7 @@ class MainFrame(wx.Frame):
                 self._browser_session = session
                 self._config = _run_config(session, tools, file_system, f'gui-{uuid.uuid4()}')
                 self._workflow = build_agent()
+                wx.CallAfter(self._take_front)  # the browser just opened in front
 
             query = await self._add_photo_context(task, glasses_item)
             answer = await self._run_turn(query)
@@ -520,7 +546,7 @@ class MainFrame(wx.Frame):
                 # the user ended the task at an approval (Stop, or Deny without
                 # a reason); the agent has already reset it
                 error = 'The task was stopped on the computer.'
-                self._log(f'[Stopped] {answer}', speak=True)
+                self._log(f'[Stopped] {answer}', speak=True, front=True)
                 self._set_status(READY)
             else:
                 # the screen reader reads the full answer; only the phone
@@ -528,7 +554,7 @@ class MainFrame(wx.Frame):
                 # any ending but ok (gave up, step limit, a failure) is an Error
                 succeeded = await self._last_status() == 'ok'
                 result = compact_glasses_reply(query, answer)
-                self._log(f'\n[{DONE if succeeded else ERROR}] {answer.strip()}', speak=True)
+                self._log(f'\n[{DONE if succeeded else ERROR}] {answer.strip()}', speak=True, front=True)
                 self._finish_status(DONE if succeeded else ERROR)
         except asyncio.CancelledError:
             # the Stop button: whatever step was running is abandoned, and the
@@ -537,12 +563,12 @@ class MainFrame(wx.Frame):
             # unlike Stop in the approval dialog, this can land mid-step, so it
             # can't promise nothing happened on the page
             self._log('[Stopped] You stopped the task. If a step was running, '
-                      'it may not have finished.', speak=True)
+                      'it may not have finished.', speak=True, front=True)
             await self._end_task('Stopped: the user stopped the task.')
             self._set_status(READY)
         except Exception as e:
             error = str(e)
-            self._log(f'[Error] {e}', speak=True)
+            self._log(f'[Error] {e}', speak=True, front=True)
             self._finish_status(ERROR)
             await self._end_task(f'Stopped by an error: {e}')
         finally:
@@ -644,7 +670,8 @@ class MainFrame(wx.Frame):
         # one graph node just finished; `update` is what it wrote to the state
         if node == 'make_plan' and update.get('plan'):
             # the task's plan: one line said aloud, the steps in the log
-            self._log(f'[Plan] {update.get("plan_summary") or "Here is my plan."}', speak=True)
+            self._log(f'[Plan] {update.get("plan_summary") or "Here is my plan."}',
+                      speak=self._plan_spoken())
             self._log_plan(update['plan'])
         if node == 'plan':
             self._set_status(RUNNING)
@@ -652,7 +679,7 @@ class MainFrame(wx.Frame):
             url, title = await self._current_page()
             description = await self._describe_decision(decision)
             if update.get('plan'):
-                self._log(f'\n[Plan] Changed. Next: {update["plan"][0]}', speak=True)
+                self._log(f'\n[Plan] Changed. Next: {update["plan"][0]}', speak=self._plan_spoken())
                 self._log_plan(update['plan'])
             self._log(f'\nStep {update.get("step", "?")}')
             self._log(f'  On page: {_describe_page(title, url)}')
@@ -673,11 +700,17 @@ class MainFrame(wx.Frame):
             reason = str(update['scratch'][-1].get('outcome', ''))
             self._log(f'  You:     {reason.replace("user said no: ", "Not that: ", 1)}')
         elif node == 'execute':
+            wx.CallAfter(self._take_front)  # the step may have opened a tab
             result = update.get('last_result')
             error = getattr(result, 'error', None)
             if error:
                 self._log(f'  Problem: {error}')
                 self._set_status(ERROR)  # back to Running when it plans again
+
+    def _plan_spoken(self) -> bool:
+        # with approval on every step, a dialog follows each new plan straight
+        # away and shows it, and its speech would cut the plan's off
+        return self.settings.get('permission_frequency') != 'every_step'
 
     def _log_plan(self, plan: list[str]):
         for i, step in enumerate(plan, 1):
