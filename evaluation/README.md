@@ -128,6 +128,21 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   reference, when the screenshots show the 2026 result (compare_r1_vision,
   which read on Wikipedia that Spain won in 2026 and then answered 2022). all
   three parts (dates, hosts, winner) are needed for a 1.
+  Google Search--20 ("the release date for the latest Fast & Furious movie")
+  has changed since 2023 too: the reference, 4 April 2025, was Fast X Part 2's
+  planned date then. by the time of the runs that film is *Fast Forever*,
+  announced for 17 March 2028, and Fast X (19 May 2023) is the latest released.
+  "latest" can mean either, so either is a 1 as the screenshots show it on the
+  day of the run: Fast Forever on 17 March 2028, Fast X on 19 May 2023, or both
+  (written down 11 Nov; every scored run already marked it this way, "reference
+  stale, answer is correct"). (e.g. 1s: versionB r0–r2 and nearly every
+  comparison answer, Fast Forever; versionC_more r1, Fast X; compare_r3_dom,
+  both.) the AI Overview rule below applies as usual: compare_r2_vision's IMDb
+  page was still blank in its screenshot and it scrolled past the date, so its
+  answer rests on the Overview and the IMDb result's snippet on Google, and it
+  says so ("I did not re-read the date on the page… it rests on the headline
+  and snippet and the Google overview"): a 1. a result's snippet on Google's
+  page, like the Overview's source cards, is not a source page.
   Google Search--19 ("the first 7 bits of the SHA of the Bert's latest
   commit") needs `eedf571`, the merge of pull request #1027, which is the
   latest commit on master. `8028c04` is the pull request's own commit ("Add
@@ -143,6 +158,20 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   `baseline_bugfix_first` and `versionA_reruns`: both answered from the
   Overview and its Pro-Football-Reference card, said they didn't open the
   page, and are a 1.)
+  an answer resting on one of the Overview's source cards has to name the
+  Overview too (decided 11 Nov): calling the card "a snippet in Google
+  results" or "a Google snippet" names a site as its source, even when it adds
+  that it didn't open the page. a snippet in Google's ordinary results (below
+  the Overview, under "Web results" in the saved page text) is different: an
+  answer read from one is a 1 if it's right and the source says truthfully
+  that the page wasn't opened. to tell them apart, check where the snippet is
+  in `stepNN_dom.txt`: inside the Overview it comes before the Overview's
+  "Good response" / "Bad response" buttons; a web result comes after "Web
+  results". (e.g. Google Search--7, compare_r1_vision and r3_vision: Apple's
+  "About iOS 17 Updates" card inside the Overview, called a Google snippet,
+  are 0s; Google Search--17, compare_r3_hybrid: the Wikipedia "Trump family"
+  web result below the Overview, a 1; Google Search--7, `baseline_second`:
+  Apple Support and TechCrunch web results on a page with no Overview, a 1.)
 - **Amazon**: judge whether the answer meets the task's conditions on
   amazon.com as the screenshots show it (US delivery address, prices in USD),
   not whether it matches the reference product. Amazon's references are only
@@ -263,6 +292,21 @@ whether it did what the task asked. record it in the run's `summary.csv`.
   not a customer's review, even when the answer says it's the summary
   (6 comparison answers). if the page shows no customer excerpt, the answer has
   to say that there isn't one, not stand in the summary for it.
+  the excerpts quoted under the "Customers say" topic buttons (Enjoyment, Value
+  for money, …) are customers' own words, and they count (decided 11 Nov). the
+  page shows them only once a topic is clicked, and no run ever clicked one, so
+  they're in no screenshot or saved page text (`stepNN_dom.txt` lists only the
+  text on display): an `extract` reads them from the page's hidden text, and
+  that extract's result in `steps.jsonl` is the record. it's a 1 if the answer
+  says a sign-in hid the full reviews and labels the quote as an excerpt or
+  snippet, without a title or author, not as the confirmed top review. an
+  answer that calls the excerpt "visible" or "shown on the page" is inaccurate,
+  since nobody opened the topic, but isn't marked down for it. (e.g. 1s:
+  `baseline_second`, `baseline_bugfix_first`, versionA r1, versionA_reruns and
+  `_reruns3`, versionB r0–r2, versionC_more r0 and r1, compare_r2_dom,
+  r2_hybrid, r3_dom; versionC r0 quoted a customer's video review the same
+  way.) for runs before the answer shape (24 Oct) whose reply names the product
+  first, the quote is the answer to judge.
   Amazon--16 ("If Free return is available, tell me how to return this
   item"): the steps have to be read from Amazon's pages for this item, i.e. the
   FREE Returns popup ("How to return this item") or the return help page it
