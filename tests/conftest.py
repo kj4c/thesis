@@ -85,12 +85,22 @@ class FakeSession:
             title=self.title,
             url=self.url,
             screenshot=self.screenshot if include_screenshot else None,
+            page_info=None,
             dom_state=SimpleNamespace(llm_representation=lambda: self.dom,
                                       selector_map=self.selector_map),
         )
 
     async def get_or_create_cdp_session(self, target_id=None, focus=True):
         return None
+
+    async def get_current_page_url(self):
+        return self.url
+
+    async def get_current_page_title(self):
+        return self.title
+
+    async def get_element_by_index(self, index):
+        return self.selector_map.get(index)
 
 
 class FakeTools:
@@ -138,10 +148,42 @@ def _no_real_models(monkeypatch):
     monkeypatch.setattr(nodes, "make_extraction_llm", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def _pinned_settings(monkeypatch):
+    # the defaults from .env.example, whatever the local .env says: the DOM
+    # agent with the verifier on and the glasses price tuning on. a test that
+    # needs another version sets it with the `perception` fixture
+    monkeypatch.setattr(nodes, "PERCEPTION", "dom")
+    monkeypatch.setattr(nodes, "PLAN_SCHEMA", nodes.PlanDecision)
+    monkeypatch.setattr(nodes, "VERIFIER", True)
+    monkeypatch.setattr(nodes, "VISION_CLEAN", False)
+    monkeypatch.setattr(nodes, "PRICE_TUNING", True)
+
+    # the fake browser has no page to wait for or check: without these the real
+    # helpers retry until their timeouts on every step
+    async def no_wait(session):
+        return None
+
+    async def no_bot_check(session):
+        return None
+    monkeypatch.setattr(nodes, "_wait_for_page", no_wait)
+    monkeypatch.setattr(nodes, "_bot_check", no_bot_check)
+
+
+@pytest.fixture
+def perception(monkeypatch):
+    # perception("vision" | "hybrid" | "dom"): switch the agent version
+    def _set(mode: str):
+        monkeypatch.setattr(nodes, "PERCEPTION", mode)
+        monkeypatch.setattr(nodes, "PLAN_SCHEMA",
+                            nodes.VisionPlanDecision if mode == "vision" else nodes.PlanDecision)
+    return _set
+
+
 @pytest.fixture
 def use_llms(monkeypatch):
     # use_llms(planner=FakeLLM(...), vision=FakeLLM(...)); vision=None means
-    # USE_VISION=false
+    # no vision model (USE_VISION=false)
     def _set(planner=None, vision=None):
         monkeypatch.setattr(nodes, "make_planner_llm", lambda: planner or ExplodingLLM())
         monkeypatch.setattr(nodes, "make_vision_llm", lambda: vision)
