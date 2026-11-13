@@ -4,13 +4,22 @@ import json
 import os
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import wx
 
 from browser_use import BrowserSession
 from dotenv import load_dotenv
+from calendar_events import (
+    add_event_to_primary_calendar,
+    extract_event_from_image,
+    extract_event_from_text,
+    is_calendar_request,
+    local_timezone_name,
+)
 from glasses_vision import enrich_prompt_with_image
 from graph import build_agent
 from langchain_core.runnables import RunnableConfig
@@ -296,6 +305,155 @@ class GlassesDataDialog(wx.Dialog):
         self.EndModal(wx.ID_OK)
 
 
+class CalendarEventDialog(wx.Dialog):
+    """Let the user correct and approve the event before it reaches Google."""
+
+    def __init__(self, parent, details):
+        super().__init__(parent, title='Review Calendar Event',
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.STAY_ON_TOP)
+        self.event = None
+        self._details = details
+        self._build()
+        self.Centre()
+
+    def _build(self):
+        from datetime import datetime, timedelta
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        intro = wx.StaticText(
+            self,
+            label='Check the event details. Nothing will be added until you choose Add to Calendar.',
+        )
+        intro.Wrap(520)
+        sizer.Add(intro, 0, wx.ALL, 12)
+
+        grid = wx.FlexGridSizer(cols=2, vgap=8, hgap=10)
+        grid.AddGrowableCol(1, 1)
+
+        def add_field(label, value, accessible):
+            grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            control = wx.TextCtrl(self, value=value or '')
+            a11y.label(control, accessible)
+            grid.Add(control, 1, wx.EXPAND)
+            return control
+
+        end_date = self._details.end_date or ''
+        end_time = self._details.end_time or ''
+        self._default_end = not end_date and not end_time
+        if self._default_end and self._details.start_date and self._details.start_time:
+            try:
+                start = datetime.strptime(
+                    f'{self._details.start_date} {self._details.start_time}', '%Y-%m-%d %H:%M'
+                )
+                inferred_end = start + timedelta(hours=1)
+                end_date = inferred_end.strftime('%Y-%m-%d')
+                end_time = inferred_end.strftime('%H:%M')
+            except ValueError:
+                pass
+
+        self.title_ctrl = add_field('Event:', self._details.title, 'Event title')
+        self.start_date_ctrl = add_field(
+            'Start date:', self._details.start_date or '', 'Start date, YYYY-MM-DD'
+        )
+        self.start_time_ctrl = add_field(
+            'Start time:', self._details.start_time or '', 'Start time, 24-hour HH:MM'
+        )
+        self.end_date_ctrl = add_field('End date:', end_date, 'End date, YYYY-MM-DD, optional')
+        self.end_time_ctrl = add_field('End time:', end_time, 'End time, 24-hour HH:MM, optional')
+        self.location_ctrl = add_field('Location:', self._details.location or '', 'Event location')
+
+        grid.Add(wx.StaticText(self, label='Description:'), 0, wx.ALIGN_TOP)
+        self.description_ctrl = wx.TextCtrl(
+            self, value=self._details.description or '',
+            style=wx.TE_MULTILINE | wx.BORDER_SIMPLE,
+        )
+        self.description_ctrl.SetMinSize((-1, 65))
+        a11y.label(self.description_ctrl, 'Event description')
+        grid.Add(self.description_ctrl, 1, wx.EXPAND)
+        sizer.Add(grid, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+
+        timezone = wx.StaticText(self, label=f"Timezone: {local_timezone_name()}")
+        timezone.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        sizer.Add(timezone, 0, wx.ALL, 12)
+        if self._default_end:
+            end_hint = wx.StaticText(
+                self, label='No end time was detected; the proposed end is one hour after the start.'
+            )
+            end_hint.Wrap(520)
+            end_hint.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+            sizer.Add(end_hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        add_btn = wx.Button(self, label='Add to Calendar')
+        add_btn.SetDefault()
+        cancel_btn = wx.Button(self, label='Cancel')
+        buttons.Add(add_btn, 0, wx.RIGHT, 8)
+        buttons.Add(cancel_btn, 0)
+        sizer.Add(buttons, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+        self.SetSizerAndFit(sizer)
+
+        add_btn.Bind(wx.EVT_BUTTON, self._on_add)
+        cancel_btn.Bind(wx.EVT_BUTTON, lambda _: self.EndModal(wx.ID_CANCEL))
+        wx.CallAfter(self.title_ctrl.SetFocus)
+
+    def _on_add(self, _event):
+        from datetime import datetime, timedelta
+
+        title = self.title_ctrl.GetValue().strip()
+        start_date = self.start_date_ctrl.GetValue().strip()
+        start_time = self.start_time_ctrl.GetValue().strip()
+        end_date = self.end_date_ctrl.GetValue().strip()
+        end_time = self.end_time_ctrl.GetValue().strip()
+
+        if not title:
+            wx.MessageBox('Enter an event title.', 'Missing Event Title', wx.OK | wx.ICON_WARNING, self)
+            self.title_ctrl.SetFocus()
+            return
+        try:
+            start = datetime.strptime(f'{start_date} {start_time}', '%Y-%m-%d %H:%M')
+        except ValueError:
+            wx.MessageBox(
+                'Enter a valid start date (YYYY-MM-DD) and time (24-hour HH:MM).',
+                'Check Event Date and Time', wx.OK | wx.ICON_WARNING, self,
+            )
+            self.start_date_ctrl.SetFocus()
+            return
+
+        if end_date or end_time:
+            if not end_date:
+                end_date = start.strftime('%Y-%m-%d')
+            if not end_time:
+                wx.MessageBox('Enter both an end date and end time, or leave both blank.',
+                              'Check Event End', wx.OK | wx.ICON_WARNING, self)
+                self.end_time_ctrl.SetFocus()
+                return
+            try:
+                end = datetime.strptime(f'{end_date} {end_time}', '%Y-%m-%d %H:%M')
+            except ValueError:
+                wx.MessageBox('Enter a valid end date and time.', 'Check Event End',
+                              wx.OK | wx.ICON_WARNING, self)
+                self.end_date_ctrl.SetFocus()
+                return
+        else:
+            end = start + timedelta(hours=1)
+
+        if end <= start:
+            wx.MessageBox('The end must be later than the start.', 'Check Event Time',
+                          wx.OK | wx.ICON_WARNING, self)
+            self.end_time_ctrl.SetFocus()
+            return
+
+        self.event = {
+            'title': title,
+            'start': start.isoformat(timespec='minutes'),
+            'end': end.isoformat(timespec='minutes'),
+            'timezone': local_timezone_name(),
+            'location': self.location_ctrl.GetValue().strip(),
+            'description': self.description_ctrl.GetValue().strip(),
+        }
+        self.EndModal(wx.ID_OK)
+
+
 # main window
 
 class MainFrame(wx.Frame):
@@ -305,6 +463,9 @@ class MainFrame(wx.Frame):
         self._agent_future: concurrent.futures.Future | None = None
         self._permission_ = threading.Event()
         self._permission_answer: dict = {}
+        self._calendar_confirmation_ = threading.Event()
+        self._calendar_event_to_add = None
+        self._prev_domain: str = ''
         # the langgraph agent (graph.py) plus the config carrying its live
         # browser and thread_id; both are created on the first run
         self._workflow = None
@@ -505,6 +666,9 @@ class MainFrame(wx.Frame):
             return
 
         self.prompt.Clear()
+        if is_calendar_request(task):
+            self._start_calendar_run({'prompt': task, 'media_type': 'text'})
+            return
         self._start_run(task)
 
     def _start_run(self, task: str, glasses_item: dict | None = None, reply=None):
@@ -863,6 +1027,14 @@ class MainFrame(wx.Frame):
                 reply(error=busy)
                 return
             store.update_status(item['id'], 'acted')
+            if is_calendar_request(item.get('prompt', '')):
+                if item.get('media_type') != 'image' or not item.get('media_path'):
+                    self._log('[Calendar] This request needs a photo of the event poster.', speak=True)
+                    reply(error='Please send a clear photo of the event poster with the calendar request.')
+                    return
+                self._log('[Calendar] Reading event details from the photo.')
+                self._start_calendar_run(item, reply)
+                return
             self._log(f'[Glasses] Acting on: {item["prompt"]}')
             self._start_run(item['prompt'], item, reply)
 
@@ -876,6 +1048,98 @@ class MainFrame(wx.Frame):
             store.delete_media(item)
             self._log('[Glasses] Cancelled — data erased.')
             reply(result='Cancelled on the computer.')
+
+    def _start_calendar_run(self, item: dict, reply=None):
+        self._set_status('Reading event…')
+        self.run_btn.Disable()
+        self.new_task_btn.Disable()
+        self._agent_future = asyncio.run_coroutine_threadsafe(
+            self._run_calendar_async(item, reply), self._loop
+        )
+
+    async def _run_calendar_async(self, item: dict, reply):
+        result, error = '', ''
+        try:
+            if item.get('media_type') == 'image' and item.get('media_path'):
+                details = await extract_event_from_image(
+                    Path(item['media_path']), item.get('prompt', '')
+                )
+            else:
+                details = await extract_event_from_text(item.get('prompt', ''))
+            self._log(
+                f'[Calendar] Found: {details.title} — '
+                f'{details.start_date or "date unclear"} '
+                f'{details.start_time or "time unclear"}.'
+            )
+            draft = await asyncio.get_running_loop().run_in_executor(
+                None, self._block_for_calendar_confirmation, details
+            )
+            if draft is None:
+                result = 'Calendar event cancelled.'
+                self._log('[Calendar] Event was not added.', speak=True)
+                self._set_status('Cancelled')
+            else:
+                self._set_status('Connecting to Google Calendar…')
+                timezone = ZoneInfo(draft['timezone'])
+
+                def google_datetime(value: str) -> str:
+                    parsed = datetime.fromisoformat(value)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone)
+                    else:
+                        parsed = parsed.astimezone(timezone)
+                    return parsed.isoformat(timespec='seconds')
+
+                event = {
+                    'summary': draft['title'],
+                    'start': {
+                        'dateTime': google_datetime(draft['start']),
+                        'timeZone': draft['timezone'],
+                    },
+                    'end': {
+                        'dateTime': google_datetime(draft['end']),
+                        'timeZone': draft['timezone'],
+                    },
+                }
+                if draft['description']:
+                    event['description'] = draft['description']
+                if draft['location']:
+                    event['location'] = draft['location']
+                link = await asyncio.to_thread(add_event_to_primary_calendar, event)
+                result = f"Added {draft['title']} to Google Calendar."
+                self._log(f'[Calendar] {result}', speak=True)
+                if link:
+                    self._log(f'[Calendar] Open event: {link}')
+                self._set_status('Done')
+        except Exception as exc:
+            error = str(exc)
+            self._log(f'[Calendar] Could not add event: {error}', speak=True)
+            self._set_status('Error')
+        finally:
+            if reply is not None:
+                reply(result=result, error=error)
+            wx.CallAfter(self.run_btn.Enable)
+            wx.CallAfter(self.new_task_btn.Enable)
+            wx.CallAfter(self._announce_run_finished)
+
+    def _block_for_calendar_confirmation(self, details):
+        self._calendar_confirmation_.clear()
+        self._calendar_event_to_add = None
+        wx.CallAfter(self._show_calendar_confirmation, details)
+        self._calendar_confirmation_.wait()
+        return self._calendar_event_to_add
+
+    def _show_calendar_confirmation(self, details):
+        dlg = None
+        try:
+            dlg = CalendarEventDialog(self, details)
+            a11y.bring_to_front()
+            dlg.ShowModal()
+            self._calendar_event_to_add = dlg.event
+        finally:
+            if dlg is not None:
+                dlg.Destroy()
+            self._calendar_confirmation_.set()
 
     # settings and voice
 

@@ -35,11 +35,16 @@ enum GlassesAgentKeys {
 final class AgentService: ObservableObject {
     static let shared = AgentService()
 
-    // HOME — update when your Mac IP changes
-    var host = "192.168.0.138"
-    // EDUROM: "10.4.165.59"
-    // HOTSPOT: "172.20.10.4"
-    var port = "8765"
+    // the Mac running the agent; editable in the debug panel (ladybug) and
+    // remembered. use the Mac's Tailscale address (100.x.x.x) to connect from
+    // any network, or its Wi-Fi address — HOME "192.168.0.138",
+    // EDUROAM "10.4.165.59", HOTSPOT "172.20.10.4"
+    @Published var host = UserDefaults.standard.string(forKey: "backendHost") ?? "192.168.0.138" {
+        didSet { UserDefaults.standard.set(host, forKey: "backendHost") }
+    }
+    @Published var port = UserDefaults.standard.string(forKey: "backendPort") ?? "8765" {
+        didSet { UserDefaults.standard.set(port, forKey: "backendPort") }
+    }
 
     @Published var status = ""
     @Published var isProcessing = false
@@ -136,7 +141,10 @@ final class AgentService: ObservableObject {
     }
 
     private func postToBackend(prompt: String, image: UIImage?) async -> String {
-        let url = URL(string: "http://\(host):\(port)/data")!
+        let address = "\(host.trimmingCharacters(in: .whitespaces)):\(port.trimmingCharacters(in: .whitespaces))"
+        guard let url = URL(string: "http://\(address)/data") else {
+            return "Invalid backend address \(address). Check it in the debug panel."
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 180
@@ -372,7 +380,21 @@ struct ContentView: View {
             debugRow("Devices", "\(deviceIds.count)")
             debugRow("Meta AI callbacks", "\(callbackCount)")
             debugRow("Conversation", agent.conversationActive ? "active" : "off")
-            debugRow("Backend", "\(agent.host):\(agent.port)")
+            HStack {
+                Text("Backend").foregroundStyle(.secondary)
+                Spacer()
+                TextField("100.x.x.x", text: $agent.host)
+                    .multilineTextAlignment(.trailing)
+                    .keyboardType(.numbersAndPunctuation)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityLabel("Backend address")
+                Text(":").foregroundStyle(.secondary)
+                TextField("8765", text: $agent.port)
+                    .keyboardType(.numberPad)
+                    .frame(width: 48)
+                    .accessibilityLabel("Backend port")
+            }
         }
         .font(.caption.monospaced())
         .padding(12)

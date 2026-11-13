@@ -131,21 +131,38 @@ async def node_respond(state: PipelineState, config: RunnableConfig) -> Command[
     # the front desk: is this a task to run in the browser, or a question we can
     # just answer? tasks go to make_plan; answers we reply to and end the turn. this
     # is also the conversational mode (e.g. "what's on this page")
+    # with a vision model available it also sees a plain screenshot (ported from
+    # kj4c's master), so "what am I looking at" questions get answered from the
+    # page as it looks. any vision failure falls back to the text model
     session, _, _ = _resources(config)
-    summary = await session.get_browser_state_summary(include_screenshot=False)
+    vision_llm = make_vision_llm()
+    summary = await session.get_browser_state_summary(include_screenshot=vision_llm is not None)
     dom_text = summary.dom_state.llm_representation()[:4000]
 
     history = _format_history(state.get("messages", [])[:-1])
-    user_msg = UserMessage(content=(
+    text = (
         f"{history}"
         f"User: {state['query']}\n\n"
         f"Current page: {summary.title} ({summary.url})\n\n"
         f"Interactive elements:\n{dom_text}"
-    ))
+    )
 
-    llm = make_planner_llm()
-    response = await _ainvoke_with_retry(llm, [RESPOND_SYSTEM, user_msg], RespondDecision)
-    decision: RespondDecision = response.completion
+    decision: RespondDecision | None = None
+    if vision_llm and summary.screenshot:
+        try:
+            parts = [ContentPartTextParam(text=text), ContentPartImageParam(
+                image_url=ImageURL(url=f"data:image/png;base64,{summary.screenshot}"))]
+            response = await _ainvoke_with_retry(
+                vision_llm, [RESPOND_SYSTEM, UserMessage(content=parts)], RespondDecision,
+            )
+            decision = response.completion
+        except Exception as e:
+            print(f"  (vision respond failed, using text: {type(e).__name__}: {str(e)[:80]})")
+    if decision is None:
+        response = await _ainvoke_with_retry(
+            make_planner_llm(), [RESPOND_SYSTEM, UserMessage(content=text)], RespondDecision,
+        )
+        decision = response.completion
 
     if decision.kind == "task":
         print(f"  respond → task")
