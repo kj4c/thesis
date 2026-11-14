@@ -113,9 +113,6 @@ async def default_error_handler(state: PipelineState, error: NodeError) -> Comma
     messages transcript), so each new prompt continues the conversation instead
     of starting blank. the live browser + Tools live in config, not state,
     because a live session isn't serialisable and would crash the checkpointer.
-
-    still to come: a SQLite checkpointer so memory survives restarts, and a Store
-    (written by resolve) for cross-conversation long-term memory.
 '''
 def build_agent():
     g: StateGraph[PipelineState] = StateGraph(PipelineState)

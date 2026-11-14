@@ -1,4 +1,3 @@
-# based on demo_part3 by KJ
 # entry point: run the agent as an interactive chat. the pieces live in
 # llm.py (model), state.py (state + resources), nodes.py (the nodes),
 # graph.py (the graph). run with:  python mvp.py

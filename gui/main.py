@@ -1,3 +1,6 @@
+# the desktop app (wxPython): the task box, activity log, approval dialogs and
+# settings, built for VoiceOver users. runs the agent graph on its own asyncio
+# loop, and takes prompts from the glasses through gui/glasses_server.py.
 import asyncio
 import concurrent.futures
 import json
@@ -237,8 +240,8 @@ class PermissionDialog(wx.Dialog):
         self.EndModal(wx.ID_OK if decision == 'yes' else wx.ID_CANCEL)
 
 
-# glasses data dialog - shown when data arrives from the glasses
-# matches the act/dismiss/cancel decision in figure 5.2
+# glasses data dialog - shown when data arrives from the glasses: act on it,
+# dismiss it, or cancel
 
 class GlassesDataDialog(wx.Dialog):
 
@@ -849,7 +852,7 @@ class MainFrame(wx.Frame):
             self._log(f'\nStep {update.get("step", "?")}')
             self._log(f'  On page: {_describe_page(title, url)}')
             # the plain one-line summary written for the user, if the planner
-            # gave one. "Step", since "Plan" is now the task's plan
+            # gave one. "Step", since "Plan" is the task's plan
             summary = getattr(decision, 'user_summary', None) or decision.reasoning
             if summary:
                 self._log(f'  Step:    {summary}')

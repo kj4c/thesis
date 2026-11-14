@@ -63,7 +63,7 @@ def bring_to_front():
     # and takes the keyboard even when the agent's browser window was in front.
     # the deprecated call on purpose: since macos 14 the newer activate() is
     # only a request, refused while another app (chrome) is active; this one
-    # still works (tested on macos 26.5, 10 nov)
+    # still works
     if AppKit is None:
         return
     app = AppKit.NSApp()

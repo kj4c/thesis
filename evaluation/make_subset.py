@@ -1,6 +1,6 @@
 # build the WebVoyager subset the evaluation runs on (writes tasks.jsonl).
 #
-# scope matches the MVP (§4.1): a search engine and one store.
+# scope matches the MVP: a search engine and one store.
 #   - Google Search: every task with a "golden" (fixed) reference answer, minus
 #     Google Search--15, which asks the agent to log into twitter with test
 #     credentials. golden answers don't go stale, so these can be scored reliably

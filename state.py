@@ -19,8 +19,7 @@ MAX_STEPS = 15
 # still on about:blank, and its profile's page-load waits
 # (minimum_wait_page_load_time etc.) are never read in 0.13.1. so after a click
 # into an Amazon product page, or one that opens a new tab, the planner could
-# read a blank page and waste a step (Amazon--16 and --12 on 16 Oct; Google
-# Search--3, --7 and Amazon--36 on 24 Oct, all after a new tab). _wait_for_page
+# read a blank page and waste a step. _wait_for_page
 # waits for the page to finish loading first, up to PAGE_READY_TIMEOUT seconds;
 # a page that never finishes (ads, long polling) is read anyway when time's up.
 # a new tab gets ABOUT_BLANK_GRACE seconds to leave about:blank, since the start
@@ -120,8 +119,8 @@ async def _wait_for_page(session: BrowserSession) -> None:
     # wait until the current tab has finished loading (see PAGE_READY_TIMEOUT).
     # returns at once on a page that's already loaded, so most steps cost one
     # quick check. each check is itself cut off at the time left: a tab that
-    # stops answering (Amazon--0 in the 24 Oct smoke run) would otherwise hold
-    # the check, and the node, until the node's own 30 s timeout
+    # stops answering would otherwise hold the check, and the node, until the
+    # node's own 30 s timeout
     start = time.monotonic()
     while True:
         left = PAGE_READY_TIMEOUT - (time.monotonic() - start)
@@ -141,7 +140,7 @@ async def _wait_for_page(session: BrowserSession) -> None:
 
 # pages where a site asks for a person: a captcha, an "I am human" checkbox,
 # Amazon's "Continue shopping" robot check, Cloudflare's "Verify you are human".
-# the agent never gets past one itself (decided 24 Oct, suggestions #5): it
+# the agent never gets past one itself: it
 # stops and hands over. an invisible reCAPTCHA (a badge on an ordinary form) is
 # left out, since it asks nothing of the user
 _BOT_CHECK_JS = """() => {
@@ -159,11 +158,10 @@ _BOT_CHECK_JS = """() => {
 }"""
 BOT_CHECK_TIMEOUT = 5.0
 # Cloudflare's check often runs by itself ("Verifying…", then the site loads)
-# and only sometimes asks for a click. stopping at once handed the user checks
-# that may have cleared on their own: Google Search--12 in version A stopped 6
-# times on Pro-Football-Reference, each 0.1 s after the page opened on
-# "Verifying…". so a Cloudflare check gets this long to clear before the agent
-# stops; it's only waited out, never clicked. every other kind stops at once.
+# and only sometimes asks for a click, so stopping at once would hand the user
+# checks that clear on their own. so a Cloudflare check gets this long to
+# clear before the agent stops; it's only waited out, never clicked. every
+# other kind stops at once.
 # kept well inside the plan node's 30 s timeout, which also covers the model call
 CLOUDFLARE_GRACE = 8.0
 
@@ -193,7 +191,7 @@ async def _bot_check(session: BrowserSession) -> str | None:
     return kind
 
 
-# when nodes.node_approve asks the user before a step (§5.2.1):
+# when nodes.node_approve asks the user before a step:
 #   auto        never: evaluation runs, and serve.py until the phone can answer
 #   every_step  every step except the final answer
 #   new_site    when a step goes to a different site

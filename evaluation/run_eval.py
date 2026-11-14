@@ -19,8 +19,9 @@
 #                 column to score. a task that didn't end with status ok is
 #                 filled in as 0 already, except: an ending in RETRY_STATUSES
 #                 (the site blocked the browser, setup failed, the model API
-#                 failed, or Amazon ran on a regional site) that is still there after the retries, left blank to
-#                 re-run rather than score; and a gave_up with the agent's own
+#                 failed, or Amazon ran on a regional site) that is still
+#                 there after the retries, left blank to re-run rather than
+#                 score; and a gave_up with the agent's own
 #                 answer, left blank to review
 #   screenshots/  per task: the page the planner read at each step (stepNN.png)
 #                 and the page at the end (final.png). both of WebVoyager's
@@ -79,8 +80,8 @@ BROWSER = {"headless": False, "viewport": {"width": 1024, "height": 768}}
 # after navigating, then logs "Page readiness timeout" and carries on. it isn't
 # a failure: it can't match the load event of a page that redirected (Google
 # adds &sei=, Amazon ?th=1), and when it gives up the page is already complete
-# or nearly so, and reading the page for the planner waits for the rest
-# (checked October 2026). a longer timeout would only slow every redirected
+# or nearly so, and reading the page for the planner waits for the rest.
+# a longer timeout would only slow every redirected
 # navigation, and past ~10 s it trips browser-use's 30 s navigation limit and
 # fails the navigation. so the warning is dropped from the console instead
 class _NoReadinessTimeout(logging.Filter):
@@ -192,7 +193,7 @@ AMAZON_GAP = 90
 # endings that say nothing about the agent's decisions: the site blocked the
 # browser, setup failed before the agent started, the model API failed or hit
 # its limit, or a step hit its 30 s node timeout (a slow API, or a browser tab
-# that stopped answering, as in Amazon--0 in the 24 Oct smoke run), or Amazon
+# that stopped answering), or Amazon
 # ran on a regional site (WRONG_SITE below).
 # after the planned tasks, each one that ended like this is run again (--retries
 # times at most), last so Amazon has had longest to forget the session
@@ -201,7 +202,7 @@ RETRY_STATUSES = ("blocked", "setup_failed", "llm_failed", "rate_limited", "time
 # Amazon can redirect to its local site (amazon.com.au) despite the US ZIP, and
 # the agent stays on a regional site by design (nodes.PLANNER_SYSTEM). the
 # references are amazon.com with a US address, so a run anywhere else isn't
-# valid: wrong_site, re-run (Amazon--12 in versionB_reruns, 31 Oct). the same
+# valid: wrong_site, re-run. the same
 # per-step check as the blocks below spots it
 WRONG_SITE = "amazon regional site"
 
@@ -223,8 +224,8 @@ _BLOCK_JS = """() => {
 
 
 # how long the runner's own checks on the browser (block check, final
-# screenshot, closing it) may take. a tab that stops answering held each of
-# them indefinitely: 70 s at the end of Amazon--0 in the 24 Oct smoke run
+# screenshot, closing it) may take. a tab that stops answering would otherwise
+# hold each of them indefinitely
 BROWSER_CHECK_TIMEOUT = 10
 
 
@@ -337,8 +338,7 @@ async def _plan_with_screenshot(state, config):
             print(f"  (screenshot failed: {e!r})")
     update = await _node_plan(state, config)
     # the element list node_plan just read (cached), in full: whether the part
-    # past nodes.DOM_LIMIT held what the agent needed (Amazon--16's size
-    # buttons, 1 Nov smoke run)
+    # past nodes.DOM_LIMIT held what the agent needed
     dom_chars = _dom_chars.get()
     if folder is not None and dom_chars is not None:
         step = update.get("step", 0)
@@ -391,7 +391,7 @@ def _describe(node: str, update: dict | None) -> dict:
 # task with one of these stock messages: no answer, a failure. otherwise the
 # planner stopped itself with its own answer, which can be right: "no product
 # meets the conditions", backed by the screenshots, is the correct answer when
-# a reference has gone stale (Amazon--6). those are reviewed like ok answers
+# a reference has gone stale. those are reviewed like ok answers
 _STOCK_STOPS = {nodes.STUCK_MESSAGE, nodes.BAD_ACTION_MESSAGE, nodes.BOT_CHECK_MESSAGE}
 
 
@@ -478,13 +478,12 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
 
     try:
         # setup is caught on its own: a page-load timeout here (navigate_to
-        # gives up after about 30 s) is a TimeoutError too, and used to be
-        # recorded as the 600 s task cap. the agent never started, so it's
-        # setup_failed, re-run rather than scored. that includes the browser
-        # failing to start, which used to crash the whole run
+        # gives up after about 30 s) is a TimeoutError too, and isn't the 600 s
+        # task cap. the agent never started, so it's setup_failed, re-run rather
+        # than scored. that includes the browser failing to start
         try:
             session, tools, file_system = await _start_resources(**BROWSER)
-            # time the task from a running browser, as before
+            # time the task from a running browser
             start = time.perf_counter()
             state["last"] = start
             await session.navigate_to(task["web"])
@@ -499,9 +498,9 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
         except Exception as e:
             setup_error = repr(e)
             raise _SetupFailed from e
-        # the first node's seconds start here, not at browser start: they
-        # used to include opening the site and Amazon's ZIP, which read as a
-        # slow respond (up to 50 s on Amazon). the task's total still counts setup
+        # the first node's seconds start here, not at browser start, so opening
+        # the site and Amazon's ZIP don't read as a slow respond. the task's
+        # total still counts setup
         state["last"] = time.perf_counter()
         setup_seconds = round(state["last"] - start, 1)
         workflow = build_agent()
@@ -566,9 +565,8 @@ async def run_task(task: dict, repeat: int, attempt: int, steps_file, out: Path)
     if answer == nodes.BOT_CHECK_MESSAGE and not blocks:
         blocks.append({"step": "agent", "kind": "bot check (agent stopped)", "url": ""})
     # the check can't tell Amazon's sign-in wall from a sign-in page the agent
-    # opened itself for content that needs one (/product-reviews/), and Amazon--12
-    # r2 in version B was marked blocked for the second while it gave up with a
-    # scoreable answer (31 Oct). a gave_up with its own answer whose only blocks
+    # opened itself for content that needs one (/product-reviews/). a gave_up
+    # with its own answer whose only blocks
     # are sign-in pages is reviewed instead, with a note to decide which it was
     signin_answered = (status == "gave_up" and _needs_review(status, answer)
                        and all(b["kind"] == "amazon sign-in" for b in blocks))

@@ -1,4 +1,6 @@
-# planner llm: pick the provider/model with .env and call it with retries.
+# the models and the version settings: builds the planner, vision, extraction
+# and glasses models from .env, calls them with retries, and reads the settings
+# that pick the agent's version (PERCEPTION, VERIFIER, VISION_CLEAN, PRICE_TUNING).
 
 import asyncio
 import os
@@ -71,8 +73,8 @@ USE_VISION = os.getenv("USE_VISION", "true").lower() in ("1", "true", "yes")
 
 # price-lookup tuning for the glasses demo: the price rules in the planner and
 # verifier prompts, plus the early exits once a $ price is found (nodes.py).
-# on by default for the demo; test runs set PRICE_TUNING=false so general tasks
-# get the original prompts and no price shortcuts
+# on by default for the demo; evaluation runs set PRICE_TUNING=false so general
+# tasks get the general prompts and no price shortcuts
 PRICE_TUNING = os.getenv("PRICE_TUNING", "true").lower() in ("1", "true", "yes")
 VISION_PROVIDER = _provider(os.getenv("VISION_PROVIDER", "anthropic"))
 _VISION_DEFAULTS = {
@@ -87,25 +89,25 @@ VISION_MODEL = os.getenv("VISION_MODEL", _VISION_DEFAULTS.get(VISION_PROVIDER, "
 
 
 def make_vision_llm():
-    # returns None when vision is disabled -> analyse uses DOM-only verification.
-    # vision only (PERCEPTION=vision) always has it: there it's the only verifier
+    # returns None when vision is disabled -> analyse uses DOM-only verification
+    # and respond reads the element list only. vision only (PERCEPTION=vision)
+    # always has it: there it's the only verifier
     if not USE_VISION and PERCEPTION != "vision":
         return None
     return _build_llm(VISION_PROVIDER, VISION_MODEL)
 
 
-# ── perception: what the planner sees of the page (suggestions #4, #10) ─────
-# the four versions in the comparison: dom (the element list, the agent as it
-# was), vision (a screenshot with numbered boxes instead), hybrid (both), and
-# vision with VERIFIER=off (no model checks). the defaults are the dom agent
+# ── perception: what the planner sees of the page ───────────────────────────
+# the four versions in the comparison: dom (the element list), vision (a
+# screenshot with numbered boxes instead), hybrid (both), and vision with
+# VERIFIER=off (no model checks). the defaults are the dom agent
 PERCEPTION = os.getenv("PERCEPTION", "dom").strip().lower()
 if PERCEPTION not in ("dom", "vision", "hybrid"):
     raise ValueError(f"Unknown PERCEPTION {PERCEPTION!r}; use dom | vision | hybrid")
 VERIFIER = os.getenv("VERIFIER", "on").strip().lower() not in ("0", "off", "false", "no")
 # vision only: also send a clean copy of the screenshot, before the numbered one.
-# the number labels cover some of the page's text (Kilimanjaro's "19,341 ft" on
-# Wikipedia, 1 Nov), and vision only has nothing else to read it from. off = the
-# numbered screenshot alone, as in WebVoyager. the pilot runs both (game plan)
+# the number labels cover some of the page's text, and vision only has nothing
+# else to read it from. off = the numbered screenshot alone, as in WebVoyager
 VISION_CLEAN = os.getenv("VISION_CLEAN", "off").strip().lower() in ("1", "on", "true", "yes")
 
 
@@ -167,9 +169,8 @@ async def _ainvoke_with_retry(llm: BaseChatModel, messages: list[BaseMessage],
         except (ModelRateLimitError, ModelProviderError) as e:
             msg = str(e)
             # a reply missing required fields is a bad draw, not a limit: ask
-            # again. the planner sent only `text` or `answer`, without `action`
-            # or `reasoning`, 5 times in versions B and C (31 Oct – 1 Nov); each
-            # ended the task as llm_failed, and the task's re-run passed every time
+            # again: the planner sometimes sends only `text` or `answer`, without
+            # `action` or `reasoning`
             if "validation error" in msg and i < attempts - 1:
                 print("  model reply was missing fields; asking again…")
                 continue

@@ -1,3 +1,5 @@
+# the settings dialog: when the agent asks before a step, text or voice input,
+# the glasses listener (addresses, port, autostart) and the Google Calendar link.
 import socket
 import threading
 from pathlib import Path

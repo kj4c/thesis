@@ -1,4 +1,5 @@
-// Add this file separately to your Xcode target (requires App Intents).
+// Siri shortcuts for the glasses app: "Snap and Search" and "Ask Glasses Agent".
+// add this file separately to your Xcode target (requires App Intents).
 // testApp.swift already defines AgentService + notification names.
 
 import AppIntents
