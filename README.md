@@ -1,166 +1,72 @@
 # gui agent
 
-a desktop app (wxPython) that lets you give a browser-automation agent (the
-LangGraph pipeline in `graph.py` / `nodes.py`, which drives
-[browser-use](https://github.com/browser-use/browser-use)) a task in plain
-english, watch it work step by step, and approve or deny what it does along
-the way. it also supports voice input from your device and can receive prompts pushed from a
-pair of Meta smart glasses (though not tested yet).
+A browser agent for blind and low-vision users: you give it a task in plain
+English, it works in a real browser step by step, and it asks before it acts.
+The agent is a LangGraph pipeline (`graph.py`, `nodes.py`) that drives
+[browser-use](https://github.com/browser-use/browser-use). It runs from a
+desktop app built for VoiceOver, a terminal chat, or a small http server that
+takes prompts from a pair of Meta smart glasses.
+
+The agent as frozen for the report's comparison is tagged **`evaluated-agent`**
+(`90bbe10`); every evaluation run records its own commit in its `config.json`.
 
 ## setup
 
-requires Python 3.14 (see `.venv/pyvenv.cfg`).
+Requires Python 3.14.
 
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate
 pip install browser-use langgraph wxPython aiohttp zeroconf sounddevice numpy google-genai python-dotenv google-api-python-client google-auth-httplib2 google-auth-oauthlib keyring cryptography
 playwright install chromium   # browser-use drives a real Chromium instance
+cp .env.example .env          # then fill in your api keys
 ```
 
-copy `.env.example` to `.env` and fill in your api keys:
+The models are chosen in `.env` (defaults in `llm.py`); fill in the key for
+each provider you use:
 
-```bash
-cp .env.example .env
-```
+- `PLANNER_PROVIDER`: the model that plans each step and checks steps from
+  the element list. every evaluation run used `anthropic` (`claude-sonnet-5-5`).
+- `VISION_PROVIDER`: checks clicks from a screenshot, is the only checker in
+  vision only, and lets the front desk (task or question?) look at the page.
+  `USE_VISION=false` turns it off in the other versions, and the planner
+  model then answers the front desk alone.
+- `EXTRACTION_PROVIDER`: reads a whole page for the `extract` action.
+- `GLASSES_VISION_PROVIDER`: describes photos from the glasses.
+- `GOOGLE_API_KEY`: also needed for voice transcription in the desktop app.
 
-- the agent's models are chosen in `.env`, not in the gui: `VISION_PROVIDER`
-  picks the main browser model (it plans and checks each step from a
-  screenshot), `PLANNER_PROVIDER` the text model used as a fallback and when
-  `USE_VISION=false`, and
-  `GLASSES_VISION_PROVIDER` the model that reads photos from the glasses
-  (see `llm.py` for the defaults). fill in the key for each provider you use.
-- `GOOGLE_API_KEY` — also needed for voice transcription, whichever
-  providers the agent uses.
+## running it
 
-## running the ui
+| how | command | asks before a step |
+|---|---|---|
+| desktop app | `python run.py` | per the app's settings (see [`gui/README.md`](gui/README.md)) |
+| terminal chat | `python mvp.py` | every step, at the prompt: `y`, `n` (optionally with a reason), or `stop` |
+| glasses server | `python serve.py` (`GLASSES_PORT` to change the port 8765) | never: the phone can't answer yet |
+| evaluation | `python evaluation/run_eval.py --label <name>` | never (see [`evaluation/README.md`](evaluation/README.md)) |
 
-```bash
-python run.py
-```
+`serve.py` and the desktop app's glasses listener use the same port and the
+same `/data` and `/health` endpoints, so run one or the other. To reach the
+Mac from the phone on any network, see "connecting the glasses" in
+[`gui/README.md`](gui/README.md).
 
-this launches the main window (`gui/main.py:AgentApp`).
+## versions
 
-## connecting the glasses from any network
+Four settings in `.env` (or on the command line) pick the agent's version:
 
-the agent runs on this mac; the phone reaches it through tailscale, a free
-private network between your own devices (nothing is exposed to the internet).
+| setting | values | what it does |
+|---|---|---|
+| `PERCEPTION` | `dom` (default), `hybrid`, `vision` | what the planner sees: the element list, the list plus a screenshot with numbered boxes, or the screenshot only |
+| `VERIFIER` | `on` (default), `off` | whether a model checks clicks and answers before they happen |
+| `VISION_CLEAN` | `off` (default), `on` | vision only: also send a screenshot without the numbers |
+| `PRICE_TUNING` | `true` (default), `false` | the glasses demo's price-lookup rules and shortcuts; evaluation runs set it `false` |
 
-1. on the mac: `brew install --cask tailscale-app`, open tailscale and sign in.
-2. on the iphone: install **tailscale** from the app store and sign in with the
-   same account.
-3. start the agent (`python run.py` or `python serve.py`). the mac's tailscale
-   address (`100.x.x.x:8765`) is shown in settings → smart glasses, or printed
-   by `serve.py` at startup.
-4. in the glasses app, tap the ladybug and enter that address as the backend.
-   it's remembered, so switch back to the wi-fi address the same way.
+The comparison's four versions are `dom`/`on`, `hybrid`/`on`, `vision`/`on`
+and `vision`/`off`.
 
-the mac has to stay awake: keep it plugged in and run the agent under
-`caffeinate -i`, e.g. `caffeinate -i python run.py`.
-
-## running the tests
+## tests
 
 ```bash
 pip install pytest pytest-asyncio
-pytest                      # offline: fake models + fake browser, ~1s
+pytest                      # offline: fake models + fake browser, a few seconds
 RUN_LIVE=1 pytest -m live   # real browser; the last test also uses your api keys
 ```
-
-## features
-
-### task input and agent runs
-- type a task into the **task** box and click **run agent** (or press the
-  configured shortcut, default `Ctrl+Return`) to start the browser agent.
-- while an agent is active, submitting a new task sends it as a **follow-up**
-  on the same page/session rather than starting over, and the agent remembers
-  the conversation so far.
-- **new task** closes the current browser session and forgets the
-  conversation, so the next run starts fresh instead of continuing as a
-  follow-up.
-
-### activity log
-- every agent step is logged in plain english: what page it's on, its
-  current plan, and the action(s) it's taking (navigating, clicking, typing,
-  scrolling, extracting page content, etc.). if the agent's own check turns
-  a step down, the log says why and the agent plans again.
-- a run ends with the agent's reply; when the reply was shortened for
-  speaking aloud, the full answer is shown underneath.
-- status bar shows `ready` / `running…` / `done` / `stopped` / `error`.
-
-### permission prompts
-- before the agent acts in the browser, a dialog can pop up describing
-  exactly what it's about to do — you can **approve** or **deny** each step.
-  the final "here is the answer" step never asks.
-- configurable frequency (see settings → permissions):
-  - **every step** — ask before every action.
-  - **when switching to a new site** — only ask when the agent navigates to
-    a new domain.
-  - **only when an error occurs** — only ask if the previous step failed or
-    was turned down by the agent's own check.
-- denying a step stops the agent run; the browser stays open and you can
-  send a follow-up.
-
-### voice input
-- toggle **voice input** to record from your microphone; toggle it again to
-  stop and transcribe. the transcription (via Gemini) is appended into the
-  task box.
-
-### smart glasses integration
-- toggle **glasses** to start a local http listener (`GlassesServer`) that
-  the companion ios app (`testApp.swift`) POSTs prompts and photos to
-  (`/data` endpoint; `/health` for connectivity checks). it takes the place
-  of `serve.py` and uses the same port (8765), so run one or the other.
-- set `host` in `testApp.swift` to the lan address shown in settings →
-  smart glasses.
-- when data arrives, a dialog shows the prompt (and any received photo/video)
-  with three choices:
-  - **act on it** — runs the prompt as an agent task. a photo is described
-    by the glasses vision model first, so "this product" means what you were
-    looking at.
-  - **dismiss for now** — keeps the item but takes no action.
-  - **cancel (erase)** — deletes the item and its saved media.
-- the phone waits for the outcome and reads it aloud: the agent's answer, or
-  that the request was dismissed, cancelled, denied, or arrived while the
-  agent was busy. it gives up after 3 minutes, so a run that sits on an
-  approval dialog for too long is reported on the phone as a network error.
-- settings → smart glasses shows the lan and mdns addresses to point the
-  glasses app at, lets you change the listening port, and toggle
-  auto-start on launch.
-
-### add an event from a glasses photo
-- Ask the glasses app to capture the event poster and say something explicit
-  such as **“Add this event to my calendar.”** The same `/data` server delivers
-  the photo and prompt to the GUI.
-- The app reads the title, date, time, and location, then opens an editable
-  review dialog. It adds nothing to Google Calendar until you select **Add to
-  Calendar**. If a date or time is unclear, fill it in before confirming.
-- Connect your account in **Settings → Calendar → Choose… → Connect Google Account**.
-  Google sign-in opens in your default browser, and you grant the app permission
-  there. The app never asks for your Google password or an API key.
-- One-time app setup requires an OAuth Desktop client configuration:
-  1. In Google Cloud Console, create or select a project and enable the Google
-     Calendar API.
-  2. Configure OAuth consent for your Google account and create an OAuth
-     client with application type **Desktop app**. For a project in testing
-     mode, add your Google account as a test user.
-  3. Download the client JSON, then select it in Settings. This file identifies
-     the app to Google; each user still connects their own account in the browser.
-- The connection record is stored in a local SQLite database under the user's
-  application-support directory. OAuth credentials are encrypted in that
-  database with a key kept in the operating system credential store. Disconnect
-  in Settings to revoke Google access and remove the saved local connection.
-- The app requests event access to the signed-in account's primary calendar.
-  Google's desktop OAuth flow requires an OAuth client ID; desktop apps are
-  public clients, so the downloaded client configuration is not an account
-  password or a private API key. Public release may require Google OAuth
-  verification for the requested user-data scope.
-
-### settings
-opened via the **settings** button; three tabs:
-- **input** — choose text or voice as the default input method, and set the
-  keyboard shortcut used to submit a task.
-- **permissions** — choose how often the agent asks for approval (see above).
-- **smart glasses** — connection info, port, autostart, and start/stop the
-  listener.
-
-settings are persisted to `settings.json` in the project root.

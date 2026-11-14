@@ -4,7 +4,7 @@
 
 import pytest
 
-from nodes import PlanDecision, _decision_to_action
+from nodes import PlanDecision, BAD_ACTION_MESSAGE, _decision_to_action
 
 
 def _d(**kw):
@@ -77,4 +77,4 @@ def test_decisions_map_to_browser_actions(tools, decision, expected):
 def test_incomplete_decisions_stop_as_failure(tools, decision):
     dump = _decision_to_action(tools, _d(**decision)).model_dump(exclude_unset=True)
     assert dump["done"]["success"] is False
-    assert "incomplete action" in dump["done"]["text"]
+    assert dump["done"]["text"] == BAD_ACTION_MESSAGE
