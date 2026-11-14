@@ -9,6 +9,12 @@ the baseline and every later comparison.
   The selection rule is at the top of the file.
 - `run_eval.py`: runs the tasks and writes `results/<time>_<label>/`. See the
   top of the file for what each output file holds.
+- `thesis_evaluation_runs/`: the runs the thesis reports, scored: one folder
+  per version (the baseline, A, B, C and the comparison's four), each laid out
+  as one 3-repeat run, and `combined_summaries/` with just their summaries.
+  Each run's `final_screenshots/` has the page at the end of every scored
+  answer (`<task>_r<repeat>.png`). The step-by-step screenshots stay in the
+  original runs' folders in `results/`, which aren't in the repository.
 
 ```bash
 python evaluation/run_eval.py --label baseline
