@@ -1,0 +1,27 @@
+kind,version,task,repeat,attempt,step,suggested,effect,why
+rejection,DOM,Google Search--12,0,0,3,right,no change,"support: a 2007 article can't show 2007 was his career best; it checked Pro-Football-Reference and gave the same answer, now sourced [no change (1)]"
+rejection,DOM,Google Search--31,0,0,4,right,no change,"support: the tie wasn't on the visible page (the ranking is an image); it answered the same tie, a 0 either way [no change (0)]"
+rejection,DOM,Amazon--6,1,0,2,wrong,cost the answer,"its own reason says the click is correct (""this is actually grounded""); the planner repeated the same click and the loop guard stopped the task [cost the answer (stuck, 0)]"
+rejection,DOM,Google Search--20,2,1,4,over-strict,no change,"asked for the latest released film too; the rule accepts Fast Forever alone, so the rejected answer would have counted; the final one gives both [no change (1)]"
+rejection,DOM,Google Search--7,2,2,5,right,saved the answer,wrong answer caught: said Apple gives no version; it then found iOS 17.1 in Apple's release notes [saved it (0 to 1)]
+rejection,Hybrid,Amazon--21,0,0,5,over-strict,no change,the DCC-3400NAS answer would have counted (1 in A–C); it applied Programmable and Stainless Steel and answered another fitting model [no change (1)]
+rejection,Hybrid,Amazon--33,0,0,4,right,saved the answer,the top three didn't match the page in front of it; the final answer reads the actual top three and the one CEER rating
+rejection,Hybrid,Google Search--31,0,0,5,right,saved the answer,"wrong answer caught: 2011/12 (68) from a niche site; it checked Wikipedia and answered 2014–15, 61 [saved it (0 to 1)]"
+rejection,Hybrid,Amazon--6,1,0,8,right,saved the answer,"too little checked: one Featured page can't back ""none""; it then read a Best Sellers page [saved it (0 to 1)]"
+rejection,Hybrid,Amazon--16,1,0,5,right,ignored,size not selected: the label still said X-Large; the agent went on to the return steps and claimed XX-Large anyway [ignored (0)]
+rejection,Hybrid,Amazon--30,1,0,4,right,saved the answer,"wrong element: the index was Newest Arrivals; it clicked Avg. Customer Review instead, which the Amazon--30 rule needs [saved it (needed for the 1)]"
+rejection,Hybrid,Google Search--31,1,0,4,right,no change,support: the page text doesn't say which season the 66 goals were; it went on to Wikipedia [no change (1)]
+rejection,Hybrid,Google Search--31,1,0,5,right,no change,"support: the claim that the graphic labels the season 2014/15 isn't shown on the page (checked on the step-5 screenshot, compare_r2_hybrid); it went on to Wikipedia"
+rejection,Hybrid,Google Search--31,1,0,8,wrong,no change,"turned down a right, sourced answer (2014–15, 61, Wikipedia) because the extract was inconsistent; it answered the same three steps later [no change (1), cost steps]"
+rejection,Hybrid,Amazon--6,2,0,3,right,ignored,"too little checked: one Featured page; it added the Black and 4-star filters but not a sort or a second page, so still a 0 [half followed (0)]"
+rejection,Hybrid,Amazon--21,2,0,3,right,saved the answer,wrong fact caught: the $179.99 price belonged to another variant; the final answer gives the DCC-3400NAS at $149 [saved it (0 to 1)]
+rejection,Vision only,Amazon--12,0,0,4,wrong,unclear,"the index was the review count, ""(1,036)"" (step-4 saved page text: [33138] acrCustomerReviewText), not the store link; the agent scrolled instead and got stuck at step 14, so the rejection may have cost the answer"
+rejection,Vision only,Amazon--16,0,0,6,wrong,no change,"its own reason ends ""the action is fine""; the planner clicked the neighbouring box (also XX-Large); the 0 is for steps from general Amazon flow [no change (0)]"
+rejection,Vision only,Google Search--19,0,0,4,wrong,no change,"its own reason says ""approving is correct""; the same click went through next step [no change (1), cost a step]"
+rejection,Vision only,Google Search--31,1,0,11,over-strict,no change,"the AI Overview answer said it wasn't confirmed, so the rule would count it; it did confirm on Wikipedia, a better answer [no change (1)]"
+rejection,Vision only,Amazon--21,0,1,2,right,ignored,"stainless steel not shown for the DCC-1200NAS (the Amazon--21 rule); it never showed it, so still a 0 [ignored (0)]"
+rejection,Vision only,Amazon--21,0,1,4,right,ignored,false claim caught: said a stainless filter was applied when none was; the final answer still claims it [ignored (0)]
+noverifier,No verifier,Amazon--6,0,0,,likely caught,,"the DOM and hybrid verifiers turned down one-page ""none"" answers 3 times, and a sort the page doesn't show is in the verifier's done rules; catching isn't fixing (4 of 14 right rejections were ignored)"
+noverifier,No verifier,Amazon--6,2,0,,likely caught,,the same claimed sort as r0
+noverifier,No verifier,Amazon--16,0,0,,likely caught,,"hybrid's verifier caught exactly this (""Size: X-Large selected, not XX-Large""), though there the agent ignored it"
+noverifier,No verifier,Amazon--16,1,0,,"flagged, no change",,the answer already says the size stayed X-Large; a verifier could flag it but not make the size button work

@@ -1,3 +1,6 @@
+# the desktop app (wxPython): the task box, activity log, approval dialogs and
+# settings, built for VoiceOver users. runs the agent graph on its own asyncio
+# loop, and takes prompts from the glasses through gui/glasses_server.py.
 import asyncio
 import concurrent.futures
 import json
@@ -22,10 +25,12 @@ from calendar_events import (
 )
 from glasses_vision import enrich_prompt_with_image
 from graph import build_agent
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 from mvp import last_assistant_reply
 from nodes import _decision_to_action
 from reply_format import compact_glasses_reply
-from state import _resources, _run_config, _start_resources
+from state import APPROVAL_POLICIES, PipelineState, _resources, _run_config, _start_resources
 from . import a11y
 from .glasses_server import GlassesServer
 from .voice import VoiceRecorder, transcribe as transcribe_voice
@@ -37,10 +42,26 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'settings.json')
 DEFAULT_SETTINGS = {
     'input_method': 'text',
     'shortcut': 'Ctrl+Return',
-    'permission_frequency': 'every_step',  # every_step | new_site | on_error
+    'permission_frequency': 'every_step',  # every_step | new_site | risky | on_error (state.APPROVAL_POLICIES)
     'glasses_port': 8765,
     'glasses_autostart': False,
 }
+
+
+# what the agent is doing, in the status bar's first field:
+#   Ready    on, and doing nothing
+#   Running  working on a task
+#   Done     finished the task successfully; back to Ready after a moment
+#   Stopped  waiting for the user to decide (an approval, or what to do with a
+#            glasses prompt); back to Running if it carries on, Ready if not
+#   Error    reported a failure; back to Running if it carries on (a failed
+#            step it retries), Ready once the task has ended
+READY, RUNNING, DONE, STOPPED, ERROR = 'Ready', 'Running', 'Done', 'Stopped', 'Error'
+
+# how long Done or Error stays up after a task ends, before going back to Ready
+STATUS_HOLD_MS = 5000
+# how long the end-of-task speech waits after bringing the app to the front
+FRONT_SPEAK_DELAY_MS = 1000
 
 
 def load_settings():
@@ -159,10 +180,15 @@ def _describe_action(action, label: str = '') -> str:
 # permission dialog
 
 class PermissionDialog(wx.Dialog):
+    # the approve node's question. the answer resumes the graph:
+    #   yes                 the step runs
+    #   no, with a reason   the agent plans again, using the reason
+    #   no without one      the task ends
+    #   stop                the task ends
     def __init__(self, parent, description: str):
         super().__init__(parent, title='Permission Required',
                          style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP)
-        self.approved = False
+        self.answer = {'decision': 'no'}  # closing the dialog any other way denies
         self._build(description)
         self.Centre()
 
@@ -181,29 +207,41 @@ class PermissionDialog(wx.Dialog):
         desc_ctrl.SetMinSize((460, 100))
         sizer.Add(desc_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
 
-        btn_sizer = wx.StdDialogButtonSizer()
+        reason_label = wx.StaticText(self, label='If you deny it, why? (optional, e.g. "wrong product"):')
+        sizer.Add(reason_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
+        # Return here denies, like Escape: without TE_PROCESS_ENTER it would
+        # press the default button, Approve, right after typing why not to
+        self._reason = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
+        self._reason.Bind(wx.EVT_TEXT_ENTER, lambda _: self._close('no'))
+        a11y.label(self._reason, 'Reason for denying',
+                   'Optional. With a reason, the agent tries another way. Without one, Deny ends the task.')
+        sizer.Add(self._reason, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         approve = wx.Button(self, wx.ID_OK, 'Approve')
         deny = wx.Button(self, wx.ID_CANCEL, 'Deny')
+        stop = wx.Button(self, label='Stop Task')
         approve.SetDefault()
-        btn_sizer.AddButton(approve)
-        btn_sizer.AddButton(deny)
-        btn_sizer.Realize()
-        sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 12)
+        for button in (approve, deny, stop):
+            btn_sizer.Add(button, 0, wx.RIGHT, 8)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
 
         self.SetSizerAndFit(sizer)
         # start on the details so a screen reader reads them when the dialog
         # opens (queued, because focus set before the dialog is shown is lost)
         wx.CallAfter(desc_ctrl.SetFocus)
-        approve.Bind(wx.EVT_BUTTON, lambda _: self._close(True))
-        deny.Bind(wx.EVT_BUTTON, lambda _: self._close(False))
+        approve.Bind(wx.EVT_BUTTON, lambda _: self._close('yes'))
+        deny.Bind(wx.EVT_BUTTON, lambda _: self._close('no'))
+        stop.Bind(wx.EVT_BUTTON, lambda _: self._close('stop'))
 
-    def _close(self, approved: bool):
-        self.approved = approved
-        self.EndModal(wx.ID_OK if approved else wx.ID_CANCEL)
+    def _close(self, decision: str):
+        reason = self._reason.GetValue().strip()
+        self.answer = {'decision': decision, 'reason': reason or None} if decision == 'no' else {'decision': decision}
+        self.EndModal(wx.ID_OK if decision == 'yes' else wx.ID_CANCEL)
 
 
-# glasses data dialog - shown when data arrives from the glasses
-# matches the act/dismiss/cancel decision in figure 5.2
+# glasses data dialog - shown when data arrives from the glasses: act on it,
+# dismiss it, or cancel
 
 class GlassesDataDialog(wx.Dialog):
 
@@ -427,7 +465,7 @@ class MainFrame(wx.Frame):
         self.settings = load_settings()
         self._agent_future: concurrent.futures.Future | None = None
         self._permission_ = threading.Event()
-        self._permission_approved = False
+        self._permission_answer: dict = {}
         self._calendar_confirmation_ = threading.Event()
         self._calendar_event_to_add = None
         self._prev_domain: str = ''
@@ -437,7 +475,9 @@ class MainFrame(wx.Frame):
         self._config = None
         self._browser_session: BrowserSession | None = None
         self._logged_decision = None
-        self._full_answer = ''
+        # the task plan last shown in an approval dialog, so it's only shown
+        # again when it changes
+        self._shown_plan: list[str] = []
 
         # one persistent asyncio loop for the app's lifetime, so a kept-alive
         # BrowserSession's async resources (event bus, CDP connection) survive
@@ -482,6 +522,11 @@ class MainFrame(wx.Frame):
         self.run_btn.SetDefault()
         btn_row.Add(self.run_btn, 0, wx.RIGHT, 8)
 
+        self.stop_btn = wx.Button(panel, label='Stop')
+        self.stop_btn.SetToolTip('Stop the task the agent is running now.')
+        self.stop_btn.Disable()
+        btn_row.Add(self.stop_btn, 0, wx.RIGHT, 8)
+
         self.voice_btn = wx.ToggleButton(panel, label='Voice Input')
         self.voice_btn.SetValue(self.settings.get('input_method') == 'voice')
         btn_row.Add(self.voice_btn, 0, wx.RIGHT, 8)
@@ -514,11 +559,12 @@ class MainFrame(wx.Frame):
 
         self.status_bar = self.CreateStatusBar(2)
         self.status_bar.SetStatusWidths([-1, 180])
-        self._show_status('Ready')
+        self._show_status(READY)
         self._show_status('Glasses: off', 1)
 
         self.prompt.Bind(wx.EVT_KEY_DOWN, self._on_prompt_key_down)
         self.run_btn.Bind(wx.EVT_BUTTON, self._on_run)
+        self.stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
         self.new_task_btn.Bind(wx.EVT_BUTTON, self._on_new_task)
         self.voice_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_voice_toggle)
         self.glasses_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_glasses_toggle)
@@ -541,14 +587,31 @@ class MainFrame(wx.Frame):
 
     # log helpers, safe to call from any thread
 
-    def _log(self, msg: str, speak: bool = False):
+    def _log(self, msg: str, speak: bool = False, front: bool = False):
         # speak=True also has the screen reader say the line, for the moments a
-        # user needs to hear without going to read the log
+        # user needs to hear without going to read the log. front=True brings
+        # the app forward first: VoiceOver drops announcements from an app in
+        # the background, and the browser is usually in front when a task ends
         wx.CallAfter(self.log.AppendText, msg + '\n')
         if speak:
             # '[Voice] Recording started.' is spoken as 'Voice: Recording started.'
             spoken = msg.strip().replace('[!] ', '').replace('[', '', 1).replace(']', ':', 1)
-            wx.CallAfter(a11y.announce, spoken)
+            wx.CallAfter(self._announce_in_front if front else a11y.announce, spoken)
+
+    def _announce_in_front(self, text: str):
+        # coming to the front makes VoiceOver say the window and the focused
+        # control; the announcement waits for that to start, so it interrupts
+        # it rather than being cut off by it. focus inside the window stays put
+        self._take_front()
+        wx.CallLater(FRONT_SPEAK_DELAY_MS, a11y.announce, text)
+
+    def _take_front(self):
+        # chrome takes the front when it starts and whenever browser_use opens
+        # or switches a tab, which leaves the keyboard and voiceover on the
+        # browser; this brings them back to this window (a no-op if it's
+        # already in front, so voiceover isn't made to repeat itself)
+        a11y.bring_to_front()
+        self.Raise()
 
     def _set_status(self, text: str):
         wx.CallAfter(self._show_status, text)
@@ -562,11 +625,32 @@ class MainFrame(wx.Frame):
             f'Status: {self.status_bar.GetStatusText(0)}, {self.status_bar.GetStatusText(1)}',
         )
 
+    def _finish_status(self, status: str):
+        # Done or Error when a task ends, then Ready after a moment, unless a new
+        # task has started by then. safe to call from any thread
+        def show():
+            self._show_status(status)
+            wx.CallLater(STATUS_HOLD_MS, back_to_ready)
+
+        def back_to_ready():
+            if not self._agent_busy() and self.status_bar.GetStatusText(0) == status:
+                self._show_status(READY)
+
+        wx.CallAfter(show)
+
+    async def _last_status(self) -> str | None:
+        # how the agent says the last turn ended (PipelineState.status)
+        if self._workflow is None or self._config is None:
+            return None
+        return (await self._workflow.aget_state(self._config)).values.get('status')
+
     def _announce_run_finished(self):
-        # the outcome is spoken by _log(speak=True). focus stays where it is,
-        # because moving it would cut that speech off; the log's cursor is left
-        # at the end for when the user goes to read the detail.
+        # the outcome is spoken by _log(speak=True, front=True) a moment after
+        # this, so moving focus back to the task box (ready for the next task)
+        # doesn't cut it off; the log's cursor is left at the end for when the
+        # user goes to read the detail
         self.log.SetInsertionPointEnd()
+        self.prompt.SetFocus()
 
     # agent execution
 
@@ -597,13 +681,15 @@ class MainFrame(wx.Frame):
             self._log(f'\nFollow-up: {task}')
         else:
             self.log.Clear()
-            self._prev_domain = ''
             self._log(f'Task: {task}')
 
         wx.CallAfter(a11y.announce, 'Agent started.')
-        self._set_status('Running…')
+        self._set_status(RUNNING)
         self.run_btn.Disable()
         self.new_task_btn.Disable()
+        self.stop_btn.Enable()
+        # while it runs, focus waits on the log, where the steps appear
+        self._focus_log()
 
         self._agent_future = asyncio.run_coroutine_threadsafe(
             self._run_agent_async(task, glasses_item, reply), self._loop
@@ -620,31 +706,45 @@ class MainFrame(wx.Frame):
                 self._browser_session = session
                 self._config = _run_config(session, tools, file_system, f'gui-{uuid.uuid4()}')
                 self._workflow = build_agent()
+                wx.CallAfter(self._take_front)  # the browser just opened in front
 
             query = await self._add_photo_context(task, glasses_item)
             answer = await self._run_turn(query)
-            if answer is None:
-                error = 'A step was denied on the computer, so the agent stopped.'
-                self._log('[Stopped] Permission denied by user.', speak=True)
-                self._set_status('Stopped')
+            if await self._last_status() == 'stopped':
+                # the user ended the task at an approval (Stop, or Deny without
+                # a reason); the agent has already reset it
+                error = 'The task was stopped on the computer.'
+                self._log(f'[Stopped] {answer}', speak=True, front=True)
+                self._set_status(READY)
             else:
-                # the phone reads the reply aloud, so it gets the short form
+                # the screen reader reads the full answer; only the phone
+                # (which reads it aloud on the glasses) gets the short form.
+                # any ending but ok (gave up, step limit, a failure) is an Error
+                succeeded = await self._last_status() == 'ok'
                 result = compact_glasses_reply(query, answer)
-                self._log(f'\n[Done] {answer}', speak=True)
-                full = self._full_answer.strip()
-                if len(full) > len(answer):
-                    self._log(f'Full answer: {full}')
-                self._set_status('Done')
+                self._log(f'\n[{DONE if succeeded else ERROR}] {answer.strip()}', speak=True, front=True)
+                self._finish_status(DONE if succeeded else ERROR)
+        except asyncio.CancelledError:
+            # the Stop button: whatever step was running is abandoned, and the
+            # task is closed out so the next prompt starts clean
+            error = 'The task was stopped on the computer.'
+            # unlike Stop in the approval dialog, this can land mid-step, so it
+            # can't promise nothing happened on the page
+            self._log('[Stopped] You stopped the task. If a step was running, '
+                      'it may not have finished.', speak=True, front=True)
+            await self._end_task('Stopped: the user stopped the task.')
+            self._set_status(READY)
         except Exception as e:
             error = str(e)
-            self._log(f'[Error] {e}', speak=True)
-            self._set_status('Error')
+            self._log(f'[Error] {e}', speak=True, front=True)
+            self._finish_status(ERROR)
             await self._end_task(f'Stopped by an error: {e}')
         finally:
             if reply is not None:
                 reply(result=result, error=error)
             wx.CallAfter(self.run_btn.Enable)
             wx.CallAfter(self.new_task_btn.Enable)
+            wx.CallAfter(self.stop_btn.Disable)
             wx.CallAfter(self._announce_run_finished)
 
     async def _add_photo_context(self, task: str, glasses_item: dict | None) -> str:
@@ -663,33 +763,45 @@ class MainFrame(wx.Frame):
             self._log(f'[Glasses] {enriched}')
         return enriched
 
-    async def _run_turn(self, query: str) -> str | None:
-        # run one user turn through the graph, pausing before every `execute` so
-        # the step can be approved first. returns the agent's reply, or None if
-        # the user denied a step.
-        workflow, config = self._workflow, self._config
+    async def _run_turn(self, query: str) -> str:
+        # run one user turn through the graph. the approve node pauses it when
+        # the permission setting calls for asking; the dialog's answer resumes
+        # it. returns the agent's reply (also when the user stopped the task)
+        workflow, session_config = self._workflow, self._config
+        if workflow is None or session_config is None:
+            raise RuntimeError('The agent has not been started.')
+        # read each turn, so a change in Settings applies to the next task. a copy
+        # with the setting added: same thread, so the chat memory carries over
+        policy = self.settings.get('permission_frequency', 'every_step')
+        config: RunnableConfig = {
+            **session_config,
+            'configurable': {
+                **session_config.get('configurable', {}),
+                'approval': policy if policy in APPROVAL_POLICIES else 'every_step',
+            },
+        }
         self._logged_decision = None
-        self._full_answer = ''
-        payload = {'query': query, 'messages': [{'role': 'user', 'content': query}]}
+        self._shown_plan = []
+        payload: PipelineState | Command = {
+            'query': query, 'messages': [{'role': 'user', 'content': query}],
+        }
         while True:
-            async for chunk in workflow.astream(
-                payload, config, stream_mode='updates', interrupt_before=['execute']
-            ):
+            async for chunk in workflow.astream(payload, config, stream_mode='updates'):
                 for node, update in chunk.items():
-                    await self._log_update(node, update or {})
+                    if node != '__interrupt__':
+                        await self._log_update(node, update or {})
 
             snapshot = await workflow.aget_state(config)
-            if not snapshot.next:
+            pending = [i for task in snapshot.tasks for i in task.interrupts]
+            if not pending:
                 return last_assistant_reply(workflow, config)
-            if not await self._approve_step(snapshot.values):
-                await self._end_task('Stopped: the user denied this step.')
-                return None
-            payload = None  # resume from the pause
+            answer = await self._ask_approval(snapshot.values, pending[0].value)
+            payload = Command(resume=answer)
 
     async def _end_task(self, note: str):
         # close out a task that stopped part-way the same way node_resolve does,
         # so the next prompt starts clean but the chat memory is kept
-        if self._workflow is None:
+        if self._workflow is None or self._config is None:
             return
         try:
             await self._workflow.aupdate_state(
@@ -713,9 +825,8 @@ class MainFrame(wx.Frame):
         self._workflow = None
         self._config = None
         self._browser_session = None
-        self._prev_domain = ''
         self.log.Clear()
-        self._set_status('Ready')
+        self._set_status(READY)
 
         if session is not None:
             asyncio.run_coroutine_threadsafe(session.kill(), self._loop)
@@ -725,14 +836,26 @@ class MainFrame(wx.Frame):
 
     async def _log_update(self, node: str, update: dict):
         # one graph node just finished; `update` is what it wrote to the state
+        if node == 'make_plan' and update.get('plan'):
+            # the task's plan: one line said aloud, the steps in the log
+            self._log(f'[Plan] {update.get("plan_summary") or "Here is my plan."}',
+                      speak=self._plan_spoken())
+            self._log_plan(update['plan'])
         if node == 'plan':
+            self._set_status(RUNNING)
             decision = update['last_decision']
             url, title = await self._current_page()
             description = await self._describe_decision(decision)
+            if update.get('plan'):
+                self._log(f'\n[Plan] Changed. Next: {update["plan"][0]}', speak=self._plan_spoken())
+                self._log_plan(update['plan'])
             self._log(f'\nStep {update.get("step", "?")}')
             self._log(f'  On page: {_describe_page(title, url)}')
-            if decision.reasoning:
-                self._log(f'  Plan:    {decision.reasoning}')
+            # the plain one-line summary written for the user, if the planner
+            # gave one. "Step", since "Plan" is the task's plan
+            summary = getattr(decision, 'user_summary', None) or decision.reasoning
+            if summary:
+                self._log(f'  Step:    {summary}')
             if description:
                 self._log(f'  Doing:   {description}')
             self._logged_decision = decision
@@ -740,16 +863,37 @@ class MainFrame(wx.Frame):
             # the agent's own check turned the step down, so it plans again
             reason = str(update['scratch'][-1].get('outcome', ''))
             self._log(f'  Check:   Not doing that. {reason.removeprefix("gate rejected: ")}')
+        elif node == 'approve' and update.get('scratch'):
+            # the user said no and gave a reason, so the agent plans again
+            reason = str(update['scratch'][-1].get('outcome', ''))
+            self._log(f'  You:     {reason.replace("user said no: ", "Not that: ", 1)}')
         elif node == 'execute':
+            wx.CallAfter(self._take_front)  # the step may have opened a tab
             result = update.get('last_result')
-            if getattr(result, 'error', None):
-                self._log(f'  Problem: {result.error}')
-            if update.get('done'):
-                self._full_answer = str(getattr(result, 'extracted_content', '') or '')
+            error = getattr(result, 'error', None)
+            if error:
+                self._log(f'  Problem: {error}')
+                self._set_status(ERROR)  # back to Running when it plans again
+
+    def _focus_log(self):
+        # cursor at the end, so the newest lines are the ones read from there
+        self.log.SetInsertionPointEnd()
+        self.log.SetFocus()
+
+    def _plan_spoken(self) -> bool:
+        # with approval on every step, a dialog follows each new plan straight
+        # away and shows it, and its speech would cut the plan's off
+        return self.settings.get('permission_frequency') != 'every_step'
+
+    def _log_plan(self, plan: list[str]):
+        for i, step in enumerate(plan, 1):
+            self._log(f'  {i}. {step}')
 
     async def _current_page(self) -> tuple[str, str]:
+        session = self._browser_session
+        if session is None:
+            return '', ''
         try:
-            session = self._browser_session
             return await session.get_current_page_url(), await session.get_current_page_title()
         except Exception:
             return '', ''
@@ -759,9 +903,11 @@ class MainFrame(wx.Frame):
         action = _decision_to_action(tools, decision)
         return _describe_action(action, await _element_label(session, decision.index))
 
-    async def _approve_step(self, values: dict) -> bool:
-        # the graph is paused just before `execute`; ask the user if the
-        # settings call for it. returns False if they deny the step.
+    async def _ask_approval(self, values: dict, question: dict) -> dict:
+        # the approve node paused the graph to ask the user (nodes.node_approve
+        # decides when, from the permission setting). show the dialog and return
+        # its answer, which resumes the graph: {"decision": "yes" | "no" | "stop",
+        # "reason": ...}
         decision = values['last_decision']
         description = await self._describe_decision(decision)
         if decision != self._logged_decision:
@@ -769,47 +915,32 @@ class MainFrame(wx.Frame):
             self._log(f'  Doing:   {description}')
             self._logged_decision = decision
 
-        url, title = await self._current_page()
-        going_to = decision.url if decision.action == 'navigate' and decision.url else url
-        if self._should_ask_permission(decision, going_to, values):
-            text = self._format_permission_description(
-                decision.reasoning, description, url, title
-            )
-            await asyncio.get_running_loop().run_in_executor(
-                None, self._block_for_permission, text
-            )
-            if not self._permission_approved:
-                return False
-
-        self._prev_domain = _domain(going_to)
-        return True
-
-    def _should_ask_permission(self, decision, url: str, values: dict) -> bool:
-        if decision.action == 'done':
-            return False  # only reports the answer; nothing happens in the browser
-        freq = self.settings.get('permission_frequency', 'every_step')
-        if freq == 'every_step':
-            return True
-        if freq == 'new_site':
-            return _domain(url) != self._prev_domain
-        if freq == 'on_error':
-            # the previous step this task was turned down by the agent's own
-            # check, or ran and came back with an error
-            scratch = values.get('scratch') or []
-            if not scratch:
-                return False
-            outcome = str(scratch[-1].get('outcome', ''))
-            error = getattr(values.get('last_result'), 'error', None)
-            return outcome.startswith('gate rejected') or bool(
-                error and outcome == str(error)[:200]
-            )
-        return False
+        # the task plan on the first question, and again only when it changes
+        plan = question.get('plan') or []
+        new_plan = plan if plan != self._shown_plan else []
+        self._shown_plan = plan
+        text = self._format_permission_description(
+            question.get('summary', ''), description,
+            question.get('page_url', ''), question.get('page_title', ''), new_plan,
+        )
+        self._set_status(STOPPED)
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._block_for_permission, text
+        )
+        answer = self._permission_answer
+        if answer.get('decision') == 'yes' or answer.get('reason'):
+            self._set_status(RUNNING)  # it runs the step, or plans again
+        return answer
 
     @staticmethod
-    def _format_permission_description(goal: str, description: str, url: str, title: str) -> str:
+    def _format_permission_description(goal: str, description: str, url: str, title: str,
+                                       plan: list[str] | None = None) -> str:
         lines = []
+        if plan:
+            lines.append('Task plan:')
+            lines.extend(f'  {i}. {step}' for i, step in enumerate(plan, 1))
         if goal:
-            lines.append(f'Plan: {goal}')
+            lines.append(f'Step: {goal}')
         if description:
             lines.append(f'Action: {description}')
         if url:
@@ -818,7 +949,7 @@ class MainFrame(wx.Frame):
 
     def _block_for_permission(self, description: str):
         self._permission_.clear()
-        self._permission_approved = False
+        self._permission_answer = {'decision': 'no'}
         wx.CallAfter(self._show_permission_dialog, description)
         self._permission_.wait()
 
@@ -826,9 +957,22 @@ class MainFrame(wx.Frame):
         dlg = PermissionDialog(self, description)
         a11y.bring_to_front()
         dlg.ShowModal()
-        self._permission_approved = dlg.approved
+        self._permission_answer = dlg.answer
         dlg.Destroy()
+        # back to the log, not the task box, however the dialog was answered;
+        # if that ended the task, focus moves on to the task box at the end
+        self._focus_log()
         self._permission_.set()
+
+    def _on_stop(self, _):
+        # cancel the running task; _run_agent_async closes it out. an approval
+        # dialog has its own Stop Task button, since this one sits behind it
+        if self._agent_busy() and self._agent_future is not None:
+            self.stop_btn.Disable()
+            # logged, not spoken: the "[Stopped]" line follows straight after
+            # and would cut it off
+            self._log('[Stopping] Stopping the task…')
+            self._agent_future.cancel()
 
     # glasses server
 
@@ -869,9 +1013,15 @@ class MainFrame(wx.Frame):
 
         dlg = GlassesDataDialog(self, item)
         a11y.bring_to_front()
+        self._show_status(STOPPED)
         dlg.ShowModal()
         choice = dlg.choice
         dlg.Destroy()
+        if self._agent_busy():
+            # a task was started while this dialog was open
+            self._show_status(RUNNING)
+        elif choice != GlassesDataDialog.ACT:
+            self._show_status(READY)  # acting starts a run, which sets Running
 
         if choice == GlassesDataDialog.ACT:
             if self._agent_busy():
@@ -1011,14 +1161,14 @@ class MainFrame(wx.Frame):
             self._log(f'[Voice] Failed to start recording: {e}', speak=True)
             self.voice_btn.SetValue(False)
             return
+        # the button and the spoken log say what voice input is doing; the
+        # status bar's first field is only for the agent
         self.voice_btn.SetLabel('Recording… (click to stop)')
-        self._set_status('Recording voice input…')
         self._log('[Voice] Recording started.', speak=True)
 
     def _stop_voice_recording(self):
         self.voice_btn.SetLabel('Voice Input')
         self.voice_btn.Disable()
-        self._set_status('Transcribing…')
         self._log('[Voice] Recording stopped, transcribing…', speak=True)
         threading.Thread(target=self._transcribe_recording, daemon=True).start()
 
@@ -1037,7 +1187,6 @@ class MainFrame(wx.Frame):
         except Exception as e:
             self._log(f'[Voice] Transcription failed: {e}', speak=True)
         finally:
-            self._set_status('Ready')
             wx.CallAfter(self.voice_btn.Enable)
 
     def _apply_transcript(self, text: str):

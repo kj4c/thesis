@@ -1,0 +1,251 @@
+{
+  "label": "compare_vision",
+  "started": "2026-11-07T22:25:17",
+  "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+  "git_dirty": false,
+  "task_ids": [
+    "Amazon--0",
+    "Amazon--3",
+    "Amazon--6",
+    "Amazon--9",
+    "Amazon--12",
+    "Amazon--16",
+    "Amazon--18",
+    "Amazon--21",
+    "Amazon--24",
+    "Amazon--27",
+    "Amazon--30",
+    "Amazon--33",
+    "Amazon--36",
+    "Amazon--39",
+    "Google Search--0",
+    "Google Search--3",
+    "Google Search--7",
+    "Google Search--12",
+    "Google Search--14",
+    "Google Search--17",
+    "Google Search--18",
+    "Google Search--19",
+    "Google Search--20",
+    "Google Search--21",
+    "Google Search--24",
+    "Google Search--28",
+    "Google Search--29",
+    "Google Search--31",
+    "Google Search--40"
+  ],
+  "repeats": 3,
+  "retries": 1,
+  "retry_statuses": [
+    "blocked",
+    "setup_failed",
+    "llm_failed",
+    "rate_limited",
+    "timed_out",
+    "wrong_site"
+  ],
+  "tasks_sha256": "a509e61b7a037d46fff4c4438e9dcecab06d16755c2545df1b6ce31c762e529f",
+  "planner": [
+    "anthropic",
+    "claude-sonnet-5-5"
+  ],
+  "claude_effort": "medium",
+  "perception": "vision",
+  "verifier": true,
+  "vision_clean": true,
+  "use_vision": true,
+  "vision": [
+    "anthropic",
+    "claude-sonnet-5-5"
+  ],
+  "extraction": [
+    "anthropic",
+    "claude-sonnet-5-5"
+  ],
+  "price_tuning": false,
+  "max_steps": 15,
+  "task_timeout": 600,
+  "approval": "auto",
+  "amazon_us_zip": "10001",
+  "amazon_gap": 90,
+  "browser_path": "/Users/ozzie/Library/Caches/ms-playwright/chromium-1223/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+  "browser": {
+    "headless": false,
+    "viewport": {
+      "width": 1024,
+      "height": 768
+    }
+  },
+  "page_ready": {
+    "timeout": 6.0,
+    "about_blank_grace": 2.0
+  },
+  "prices_usd_per_mtok": {
+    "claude-sonnet-5-5": {
+      "input": 2.0,
+      "output": 10.0,
+      "cache_read": 0.2,
+      "cache_write": 2.5
+    }
+  },
+  "python": "3.14.8",
+  "packages": {
+    "browser-use": "0.13.1",
+    "langgraph": "1.2.6",
+    "langchain-core": "1.6.10",
+    "pydantic": "2.12.5"
+  },
+  "combined_from": [
+    {
+      "folder": "20261107-2225_compare_r1_vision",
+      "label": "compare_r1_vision",
+      "started": "2026-11-07T22:25:17",
+      "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+      "git_dirty": false,
+      "repeats": 1,
+      "task_ids": [
+        "Amazon--0",
+        "Amazon--3",
+        "Amazon--6",
+        "Amazon--9",
+        "Amazon--12",
+        "Amazon--16",
+        "Amazon--18",
+        "Amazon--21",
+        "Amazon--24",
+        "Amazon--27",
+        "Amazon--30",
+        "Amazon--33",
+        "Amazon--36",
+        "Amazon--39",
+        "Google Search--0",
+        "Google Search--3",
+        "Google Search--7",
+        "Google Search--12",
+        "Google Search--14",
+        "Google Search--17",
+        "Google Search--18",
+        "Google Search--19",
+        "Google Search--20",
+        "Google Search--21",
+        "Google Search--24",
+        "Google Search--28",
+        "Google Search--29",
+        "Google Search--31",
+        "Google Search--40"
+      ]
+    },
+    {
+      "folder": "20261108-0938_compare_r2_vision",
+      "label": "compare_r2_vision",
+      "started": "2026-11-08T09:38:22",
+      "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+      "git_dirty": false,
+      "repeats": 1,
+      "task_ids": [
+        "Amazon--0",
+        "Amazon--3",
+        "Amazon--6",
+        "Amazon--9",
+        "Amazon--12",
+        "Amazon--16",
+        "Amazon--18",
+        "Amazon--21",
+        "Amazon--24",
+        "Amazon--27",
+        "Amazon--30",
+        "Amazon--33",
+        "Amazon--36",
+        "Amazon--39",
+        "Google Search--0",
+        "Google Search--3",
+        "Google Search--7",
+        "Google Search--12",
+        "Google Search--14",
+        "Google Search--17",
+        "Google Search--18",
+        "Google Search--19",
+        "Google Search--20",
+        "Google Search--21",
+        "Google Search--24",
+        "Google Search--28",
+        "Google Search--29",
+        "Google Search--31",
+        "Google Search--40"
+      ]
+    },
+    {
+      "folder": "20261108-1325_compare_r3_vision",
+      "label": "compare_r3_vision",
+      "started": "2026-11-08T13:25:27",
+      "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+      "git_dirty": false,
+      "repeats": 1,
+      "task_ids": [
+        "Amazon--0",
+        "Amazon--3",
+        "Amazon--6",
+        "Amazon--9",
+        "Amazon--12",
+        "Amazon--16",
+        "Amazon--18",
+        "Amazon--21",
+        "Amazon--24",
+        "Amazon--27",
+        "Amazon--30",
+        "Amazon--33",
+        "Amazon--36",
+        "Amazon--39",
+        "Google Search--0",
+        "Google Search--3",
+        "Google Search--7",
+        "Google Search--12",
+        "Google Search--14",
+        "Google Search--17",
+        "Google Search--18",
+        "Google Search--19",
+        "Google Search--20",
+        "Google Search--21",
+        "Google Search--24",
+        "Google Search--28",
+        "Google Search--29",
+        "Google Search--31",
+        "Google Search--40"
+      ]
+    },
+    {
+      "folder": "20261108-1619_compare_r1_vision_reruns",
+      "label": "compare_r1_vision_reruns",
+      "started": "2026-11-08T16:19:31",
+      "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+      "git_dirty": false,
+      "repeats": 1,
+      "task_ids": [
+        "Amazon--30"
+      ]
+    },
+    {
+      "folder": "20261108-1632_compare_r3_vision_reruns",
+      "label": "compare_r3_vision_reruns",
+      "started": "2026-11-08T16:32:31",
+      "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+      "git_dirty": false,
+      "repeats": 1,
+      "task_ids": [
+        "Amazon--30"
+      ]
+    },
+    {
+      "folder": "20261108-1904_compare_r3_vision_reruns",
+      "label": "compare_r3_vision_reruns",
+      "started": "2026-11-08T19:04:47",
+      "git_commit": "90bbe1017202f1f20fa24e7603dfd170fd3bb364",
+      "git_dirty": false,
+      "repeats": 1,
+      "task_ids": [
+        "Amazon--30"
+      ]
+    }
+  ],
+  "combined_note": "Made 12 Nov 2026 from the folders in combined_from, laid out as one --repeats 3 run: each source's repeat is renumbered, and each re-run is the next attempt of the repeat it filled. Fields that differ between sources: none"
+}

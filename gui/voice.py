@@ -1,7 +1,7 @@
 # microphone capture + speech-to-text for the voice input toggle
 #
-# Records from the default mic while active, then sends the WAV audio to
-# Gemini for transcription (reuses the same GOOGLE_API_KEY as the agent LLM).
+# records from the default mic while active, then sends the WAV audio to
+# Gemini for transcription (needs GOOGLE_API_KEY).
 
 import io
 import os

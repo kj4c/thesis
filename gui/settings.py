@@ -1,3 +1,5 @@
+# the settings dialog: when the agent asks before a step, text or voice input,
+# the glasses listener (addresses, port, autostart) and the Google Calendar link.
 import socket
 import threading
 from pathlib import Path
@@ -12,6 +14,7 @@ from network import tailscale_ip
 PERMISSION_OPTIONS = [
     ('Every step', 'every_step'),
     ('When switching to a new site', 'new_site'),
+    ('Only for risky steps (buying, sending, signing in)', 'risky'),
     ('Only when an error occurs', 'on_error'),
 ]
 

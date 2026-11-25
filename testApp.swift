@@ -1,9 +1,6 @@
-//
-//  ContentView.swift
-//  testApp
-//
-//  Created by Khye Jac Low on 17/6/2026.
-//
+// the iPhone companion app for the Meta glasses: takes a photo from the glasses
+// and a spoken command, sends them to the agent's POST /data (serve.py, or the
+// desktop app's listener), and reads the answer aloud.
 import SwiftUI
 import Combine
 import CoreBluetooth

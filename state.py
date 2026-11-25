@@ -1,20 +1,39 @@
 # the shared pipeline state + the runtime resources nodes and runners both need.
 
+import asyncio
 import operator
+import os
 import tempfile
-from typing import TypedDict, Annotated, Any
+import time
+from typing import TypedDict, Annotated, Any, Required
 
 from langchain_core.runnables import RunnableConfig
 from browser_use import BrowserSession, Tools, ActionResult
 from browser_use.filesystem.file_system import FileSystem
 
-# safety cap so a confused planner can't loop forever
-MAX_STEPS = 12
+# safety cap so a confused planner can't loop forever. 15 matches WebVoyager's
+# own iteration limit (--max_iter 15 in its run.sh), so evaluation runs compare
+MAX_STEPS = 15
+
+# browser-use reads a page almost at once: it waits 0.3 s at most, skips a tab
+# still on about:blank, and its profile's page-load waits
+# (minimum_wait_page_load_time etc.) are never read in 0.13.1. so after a click
+# into an Amazon product page, or one that opens a new tab, the planner could
+# read a blank page and waste a step. _wait_for_page
+# waits for the page to finish loading first, up to PAGE_READY_TIMEOUT seconds;
+# a page that never finishes (ads, long polling) is read anyway when time's up.
+# a new tab gets ABOUT_BLANK_GRACE seconds to leave about:blank, since the start
+# page can be about:blank too (the gui, mvp.py), and that shouldn't cost the
+# full timeout
+PAGE_READY_TIMEOUT = 6.0
+ABOUT_BLANK_GRACE = 2.0
+_PAGE_READY_JS = "() => location.protocol + ' ' + document.readyState"
 
 
 class PipelineState(TypedDict, total=False):
-    # the current user turn (latest natural language input)
-    query: str
+    # the current user turn (latest natural language input). Required: every
+    # entry point (mvp.py, serve.py, the gui) sends it with each turn
+    query: Required[str]
 
     # chat memory
     messages: Annotated[list[dict], operator.add]
@@ -33,39 +52,167 @@ class PipelineState(TypedDict, total=False):
     # forever)
     # different from `messages`, which is the cross-turn chat memory.
     scratch: list[dict]
+    # vision only: what the planner has read so far this task (VisionPlanDecision.notes),
+    # since it sees only the current screenshot. cleared with scratch
+    notes: str
+
+    # the task's plan: a few plain-language steps the user sees before the
+    # first step (set by make_plan, revised by plan when a step fails or is
+    # turned down). empty for the glasses price tasks, which skip it. written
+    # fresh at the start of every task, so it's never reset at the end
+    plan: list[str]
+    # the one-line version of the plan, said aloud when the task starts
+    plan_summary: str
+
+    # how the last turn ended, for the UI / logs (placeholder set).
+    # set by respond/resolve on a normal finish and by
+    # graph.default_error_handler on a failure:
+    #   ok | gave_up | max_steps | stopped | timed_out | rate_limited | llm_failed | execute_failed | failed
+    # stopped: the user ended the task at an approval (Stop, or no without a reason)
+    # gave_up: the agent stopped itself without completing the task (done with
+    # success=False, from the planner or a loop guard)
+    status: str
+    # the error behind a failure status, set by graph.default_error_handler, so
+    # logs can tell an overloaded API from bad model output. not cleared on a
+    # later success: read it only alongside a failure status
+    last_error: str
     '''
     TODO:
     properties that update as it progresses based on current node plan
     - relevant perception information  (partially done: read live in node_plan)
     - adjusted query
-    - current plan (to execute)        (done: `plan` field above)
+    - current plan (to execute)        (done: `plan` field above, from make_plan)
     '''
 
 
-def _resources(config: RunnableConfig) -> tuple[BrowserSession, Tools, FileSystem]:
+def _resources(config: RunnableConfig | None) -> tuple[BrowserSession, Tools, FileSystem]:
     # grab the live browser + executor + filesystem out of config 
     cfg = (config or {}).get("configurable", {})
     return cfg["session"], cfg["tools"], cfg["file_system"]
 
 
-async def _start_resources() -> tuple[BrowserSession, Tools, FileSystem]:
+async def _start_resources(**browser_options: Any) -> tuple[BrowserSession, Tools, FileSystem]:
     # spin up the per-run resources: a live browser (kept alive so follow-ups
     # reuse the page), the action executor, and a scratch filesystem 
-    session = BrowserSession(keep_alive=True)
+    # BROWSER_PATH (optional, .env) pins the browser binary: browser_use misses
+    # newer playwright chromium ("Google Chrome for Testing.app"), and a fixed
+    # browser keeps evaluation runs comparable. unset = browser_use's own search
+    # browser_options go straight to BrowserSession (evaluation fixes the window
+    # size with them); the gui and mvp.py pass none and get browser_use's defaults
+    browser_path = os.getenv("BROWSER_PATH")
+    if browser_path:
+        browser_options["executable_path"] = browser_path
+    session = BrowserSession(keep_alive=True, **browser_options)
     await session.start()
     tools = Tools()
     file_system = FileSystem(tempfile.mkdtemp(prefix="mvp_fs_"))
     return session, tools, file_system
 
 
+async def _page_state(session: BrowserSession) -> tuple[str, str]:
+    page = await session.must_get_current_page()
+    protocol, ready_state = (await page.evaluate(_PAGE_READY_JS)).split()
+    return protocol, ready_state
+
+
+async def _wait_for_page(session: BrowserSession) -> None:
+    # wait until the current tab has finished loading (see PAGE_READY_TIMEOUT).
+    # returns at once on a page that's already loaded, so most steps cost one
+    # quick check. each check is itself cut off at the time left: a tab that
+    # stops answering would otherwise hold the check, and the node, until the
+    # node's own 30 s timeout
+    start = time.monotonic()
+    while True:
+        left = PAGE_READY_TIMEOUT - (time.monotonic() - start)
+        if left <= 0:
+            return
+        try:
+            protocol, ready_state = await asyncio.wait_for(_page_state(session), left)
+            web = protocol in ("http:", "https:")
+            if ready_state == "complete" and (web or time.monotonic() - start >= ABOUT_BLANK_GRACE):
+                return
+        except TimeoutError:
+            return  # the tab isn't answering: read it as it is
+        except Exception:
+            pass  # mid-navigation, or the new tab isn't attached yet
+        await asyncio.sleep(0.25)
+
+
+# pages where a site asks for a person: a captcha, an "I am human" checkbox,
+# Amazon's "Continue shopping" robot check, Cloudflare's "Verify you are human".
+# the agent never gets past one itself: it
+# stops and hands over. an invisible reCAPTCHA (a badge on an ordinary form) is
+# left out, since it asks nothing of the user
+_BOT_CHECK_JS = """() => {
+  const host = location.host, url = location.href, path = location.pathname;
+  const text = document.body ? document.body.innerText : '';
+  if (host.includes('amazon.')) {
+    if (path.startsWith('/checkpoint/') || (text.includes('To continue, please click the') && text.includes('Continue shopping'))) return 'amazon checkpoint';
+    if (url.includes('validateCaptcha') || text.includes('Enter the characters you see below')) return 'amazon captcha';
+  }
+  if (host.includes('google.') && path.startsWith('/sorry')) return 'google captcha';
+  if (document.querySelector('iframe[src*="challenges.cloudflare.com"]') || /^just a moment/i.test(document.title)) return 'cloudflare check';
+  const widget = [...document.querySelectorAll('iframe[src*="recaptcha/api2/anchor"], iframe[src*="hcaptcha.com"]')]
+    .find(f => !/size=invisible/.test(f.src) && f.offsetWidth > 0);
+  return widget ? 'captcha' : '';
+}"""
+BOT_CHECK_TIMEOUT = 5.0
+# Cloudflare's check often runs by itself ("Verifying…", then the site loads)
+# and only sometimes asks for a click, so stopping at once would hand the user
+# checks that clear on their own. so a Cloudflare check gets this long to
+# clear before the agent stops; it's only waited out, never clicked. every
+# other kind stops at once.
+# kept well inside the plan node's 30 s timeout, which also covers the model call
+CLOUDFLARE_GRACE = 8.0
+
+
+async def _bot_check(session: BrowserSession) -> str | None:
+    # the kind of bot check the current page shows, or None. a page that can't
+    # be read in time isn't evidence of one
+    async def check(limit: float) -> str | None:
+        async def read() -> str:
+            page = await session.must_get_current_page()
+            return await page.evaluate(_BOT_CHECK_JS)
+        try:
+            return await asyncio.wait_for(read(), limit) or None
+        except Exception:
+            return None
+
+    kind = await check(BOT_CHECK_TIMEOUT)
+    if kind != "cloudflare check":
+        return kind
+    deadline = time.monotonic() + CLOUDFLARE_GRACE
+    while (left := deadline - time.monotonic()) > 0:
+        await asyncio.sleep(min(0.5, left))
+        kind = await check(max(0.5, min(BOT_CHECK_TIMEOUT, deadline - time.monotonic())))
+        if kind != "cloudflare check":
+            await _wait_for_page(session)  # the site it let through is loading
+            return kind
+    return kind
+
+
+# when nodes.node_approve asks the user before a step:
+#   auto        never: evaluation runs, and serve.py until the phone can answer
+#   every_step  every step except the final answer
+#   new_site    when a step goes to a different site
+#   risky       only for steps that commit to something (buy, send, sign in, ...)
+#   on_error    when the previous step failed or the agent's own check turned it down
+APPROVAL_POLICIES = ("auto", "every_step", "new_site", "risky", "on_error")
+
+
 def _run_config(session: BrowserSession, tools: Tools, file_system: FileSystem,
-                thread_id: str) -> RunnableConfig:
+                thread_id: str, approval: str = "every_step") -> RunnableConfig:
+    # approval defaults to asking: a caller that can't answer has to say so
+    if approval not in APPROVAL_POLICIES:
+        raise ValueError(f"approval must be one of {APPROVAL_POLICIES}, not {approval!r}")
     return {
         "configurable": {
             "session": session, "tools": tools,
             "file_system": file_system, "thread_id": thread_id,
+            "approval": approval,
         },
-        # recursion_limit has to be bigger than the nodes-per-step so our own
-        # MAX_STEPS guard (not langgraph's) is what stops the loop
-        "recursion_limit": 5 * MAX_STEPS + 5,
+        # recursion_limit has to be bigger than the nodes-per-step (plan,
+        # analyse, approve, execute, resolve) so our own MAX_STEPS guard (not
+        # langgraph's) is what stops the loop
+        "recursion_limit": 6 * MAX_STEPS + 5,
     }
